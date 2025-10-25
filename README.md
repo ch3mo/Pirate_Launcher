@@ -11,6 +11,8 @@ Pirate Launcher is a simple, user-friendly desktop application for managing and 
 - Launch, remove, and refresh games easily.
 - Instant boot with no delays, even offline.
 
+<img width="1397" height="607" alt="image" src="https://github.com/user-attachments/assets/0fb4f3ec-5329-4386-8202-4afca8b568ed" />
+
 ## Prerequisites
 - **Python 3.8+**: Download from [python.org](https://www.python.org/downloads/).
 - **Libraries**: `requests` and `pillow` (installed via pip).
