@@ -19,6 +19,18 @@ Pirate Launcher is a simple, user-friendly desktop application for managing and 
 - **No internet required after initial scrape** (art and info are cached locally).
 
 ## Installation
+Choose your preferred method:
+
+### Option 1: Pre-built EXE (Recommended - No Python Needed)
+1. **Download the Latest Release**:
+   - Visit [GitHub Releases](https://github.com/ch3mo/Pirate_Launcher/releases/tag/Base) (always use the latest release if possible).
+   - Download the `.exe` file from the assets section.
+
+2. **Run the Launcher**:
+   - Double-click the `.exe` file to launch.
+   - No installation required — runs directly.
+
+### Option 2: Source Code (For Developers)
 1. **Clone the Repository**:
     git clone https://github.com/yourusername/pirate-launcher.git
     cd pirate-launcher
