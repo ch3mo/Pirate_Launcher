@@ -1,108 +1,88 @@
 # Pirate Launcher
 
-Pirate Launcher is a simple, user-friendly desktop application for managing and launching your games, including pirated, Steam, Xbox, and Microsoft Store titles. It automatically scrapes game art and descriptions from RAWG and Steam API, providing a clean interface with alphabetical sorting and platform badges.
+**Ad-free, offline-first game launcher** for pirated games, Steam installs, Xbox titles, and more.  
+Track real playtime with an optional in-game overlay, import your Steam hours, switch between multiple profiles, and enjoy auto-scraped artwork + metadata — 100% local, zero telemetry, no bloat.
+
+**Latest Release:** [v1.1.0 – Profiles, Playtime Overlay, Steam Sync & UI Overhaul](https://github.com/ch3mo/Pirate_Launcher/releases/latest)
 
 ## Features
-- Manual addition of games by selecting `.exe` files from specific directories ( (Pirated, Steam, Xbox).
-- Automatic scraping of game art and descriptions (cached for offline use).
-- Alphabetical sorting of games with platform indicators (Steam, Xbox, Pirated).
-- Light/dark theme toggle.
-- Multi-profile support for organizing games.
-- Launch, remove, and refresh games easily.
-- Instant boot with no delays, even offline.
 
-<img width="1397" height="607" alt="image" src="https://github.com/user-attachments/assets/0fb4f3ec-5329-4386-8202-4afca8b568ed" />
+- **Multi-Profile Support**  
+  Create and switch profiles (Main / Kids / Retro / etc.) — each has its own games, playtime, favorites, and settings.
 
-## Prerequisites
-- **Python 3.8+**: Download from [python.org](https://www.python.org/downloads/).
-- **Libraries**: `requests` and `pillow` (installed via pip).
-- **No internet required after initial scrape** (art and info are cached locally).
+- **Accurate Playtime Tracking**  
+  Monitors running processes (psutil) and adds session + total playtime automatically. Persists across restarts.
 
-## Installation
-Choose your preferred method:
+- **In-Game Overlay** (per-game toggle)  
+  Clean, semi-transparent bar at the top: shows current session time, total played, and start time. Safe to disable for anti-cheat games.
 
-### Option 1: Pre-built EXE (Recommended - No Python Needed)
-1. **Download the Latest Release**:
-   - Visit [GitHub Releases](https://github.com/ch3mo/Pirate_Launcher/releases/tag/Base) (always use the latest release if possible).
-   - Download the `.exe` file from the assets section.
+- **Steam Playtime Import/Sync**  
+  Pull forever playtime from your Steam library via Web API. Incremental sync (only new time) or force full overwrite. Setup dialog included.
 
-2. **Run the Launcher**:
-   - Double-click the `.exe` file to launch.
-   - No installation required — runs directly.
+- **Auto Metadata & Artwork**  
+  Scrapes covers, titles, descriptions, genres, release dates from Steam. Caches images and info locally forever — works 100% offline after first load.
 
-### Option 2: Source Code (For Developers)
-1. **Clone the Repository**:
-    git clone https://github.com/yourusername/pirate-launcher.git
-    cd pirate-launcher
+- **Modern UI & Navigation**  
+  - Platform filter (All / Steam / Xbox / Pirated) with icons  
+  - Search, sort (name / recent / playtime / favorites)  
+  - Favorites (★ toggle)  
+  - Right-click context menu  
+  - Scrolling long titles  
+  - Toast notifications for actions  
+  - Keyboard shortcuts (Ctrl+F search, Enter launch, Delete remove)
 
-2. **Install Dependencies**:
-    pip install requests pillow
+- **Privacy & Control**  
+  - Fully local — no accounts, no data sent anywhere  
+  - Toggle logging, reset playtime, clear profiles, wipe all data  
+  - Choose "Date & Time" or "Time Ago" for recently played column
 
-## Setup
-1. **Run the Launcher**:
-- Create a batch file (e.g., `start.bat`) in the same directory:
-    @echo off
-    pythonw pirate_launcher.py
+## Screenshots
+**SIGN IN**
+<img width="1647" height="834" alt="image" src="https://github.com/user-attachments/assets/7d4e28e9-4f90-4027-814d-fb7f979c92ec" />
+**GAME LIBARY**
+<img width="1947" height="980" alt="image" src="https://github.com/user-attachments/assets/5b570ec2-1ce4-456b-81c8-42120622fdb2" />
+**SETTINGS**
+<img width="1949" height="978" alt="image" src="https://github.com/user-attachments/assets/986a1c14-709f-4b68-afe1-deba4e9e1c90" />
+**IMPORT STEAM PLAYTIME**
 
-- Double-click `start.bat` to launch (no command window).
+<img width="541" height="461" alt="image" src="https://github.com/user-attachments/assets/1ef972a6-d697-43a0-897a-e750fe28abfe" />
 
-2. **Initial Setup**:
-- On first run, create an account or sign in.
-- Add games using the "Add Game" dropdown, selecting from Pirated, Steam, or Xbox directories.
-- Art and descriptions will be scraped and cached automatically.
+**OVERLAY & NOTIFICATIONS**
+<img width="5117" height="1439" alt="image" src="https://github.com/user-attachments/assets/ec28e45a-9e14-4e4e-a660-5969e1f35860" />
 
-## Instructions / Usage
-1. **Adding a Game**:
-- Click "Add Game" dropdown.
-- Choose source (Pirated, Steam, Xbox).
-- Browse and select the game's `.exe` file.
-- Enter the game name (auto-suggested from folder).
-- Art and description are scraped and shown instantly.
 
-2. **Launching a Game**:
-- Select a game from the list.
-- Click "Launch" to run it.
+## Download & Install
 
-3. **Removing a Game**:
-- Select a game.
-- Click "Remove".
+Grab the latest single-file `.exe` from [Releases](https://github.com/ch3mo/Pirate_Launcher/releases):  
+→ No Python needed — just run it.
 
-4. **Refreshing List**:
-- Click "Refresh" to update the game list.
+**Latest:** Pirate_Launcher_v1.1.0.exe (recommended)
 
-5. **Theme Toggle**:
-- Go to Settings > Toggle Theme.
+## Building from Source (optional)
 
-6. **Profiles**:
-- Settings > Profiles > Create/Switch/Delete.
+Requirements:  
+- Python 3.9+  
+- `pip install requests pillow psutil`
 
-7. **Clear Data**:
-- Settings > Clear Games or Clear All Data.
+Run:  
+python pirate_launcher.py
 
-## FAQ
-- **Why is there a delay on first add?**  
-The launcher scrapes art and description from online APIs. Once cached, it's instant and works offline.
+(Or use pyinstaller to bundle your own .exe)
 
-- **No art or description for a game?**  
-Try renaming the game to match the exact title on RAWG or Steam. If it persists, the game may not be indexed yet.
+## Roadmap / Known Limitations
 
-- **Game not launching?**  
-Ensure the `.exe` path is correct. Some games may require additional dependencies or admin rights.
+- No auto-updater yet  
+- Scraping depends on good title matches (manual refresh helps)  
+- Large libraries can be slow to load initially  
+- No bulk folder import (add .exe one at a time for now)
 
-- **How to add Microsoft Store games?**  
-Use "Pirated Games" option and navigate to `C:\Program Files\WindowsApps` (may require admin access).
+## Feedback & Contributing
 
-- **Can I add custom platforms?**  
-Currently supports Pirated, Steam, Xbox. For others, use "Pirated Games" option.
+Found a bug? Got a feature idea?  
+→ Open an [Issue](https://github.com/ch3mo/Pirate_Launcher/issues)  
+→ PRs welcome — especially for UI tweaks, better scraping, or new platforms!
 
-- **Is this secure?**  
-Yes, no data is shared. All scraping is local; no personal info stored.
+Join the Discord for chat, screenshots, bug reports:  
+https://discord.gg/HYsgwK9pje
 
-- **How to get help?**  
-Join our Discord for support, updates, and community: https://discord.gg/HYsgwK9pje
-
-## Contributing
-Fork the repo, make changes, and submit a pull request. Suggestions for new features (e.g., more platforms, search bar) are welcome!
-
-## License
-MIT License - feel free to use and modify.
+Thanks for checking it out & enjoy your games! 🏴‍☠️
