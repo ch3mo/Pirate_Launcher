@@ -11,7 +11,7 @@ import threading
 from PIL import Image, ImageOps, ImageTk
 from io import BytesIO
 from urllib.parse import quote
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import queue
 import logging
 import psutil
@@ -27,12 +27,36 @@ import pyperclip
 from tqdm import tqdm
 from urllib.parse import urlparse
 
+from collections import defaultdict
+
+from launcher_features import (
+    atomic_write_json,
+    append_captains_entry,
+    append_session_record,
+    build_hall_of_fame_payload,
+    export_sessions_csv,
+    extract_zip_to,
+    fake_rarity_percent,
+    igdb_fetch_metadata,
+    iso_week_id,
+    load_seasonal,
+    render_profile_card_png,
+    resolve_portable_path,
+    run_plugin_hooks,
+    save_seasonal,
+    sha256_file,
+    to_portable_path,
+    windows_idle_seconds,
+)
+
 DIR_NAME = "Pirate Launcher Components"
 BASE_DIR = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)
 DIR = os.path.join(BASE_DIR, DIR_NAME)
 IMG = os.path.join(DIR, "images")
+PLUGIN_DIR = os.path.join(DIR, "plugins")
 os.makedirs(DIR, exist_ok=True)
 os.makedirs(IMG, exist_ok=True)
+os.makedirs(PLUGIN_DIR, exist_ok=True)
 
 PLACE = os.path.join(IMG, "no.png")
 STAR_PLACE = os.path.join(IMG, "star.png")
@@ -298,6 +322,16 @@ class DownloadManagerWindow:
             justify="left",
         ).pack(fill="x", padx=14, pady=(0, 10))
 
+        prog_frame = tk.Frame(self.window, bg="#1e1e1e")
+        prog_frame.pack(fill="x", padx=14, pady=(0, 6))
+        self.download_progress_var = tk.DoubleVar(value=0)
+        self.download_progress_label = tk.Label(
+            prog_frame, text="", bg="#1e1e1e", fg="#88aa88", font=("", 9)
+        )
+        self.download_progress_label.pack(anchor="w")
+        self.download_progress = ttk.Progressbar(prog_frame, variable=self.download_progress_var, maximum=100)
+        self.download_progress.pack(fill="x")
+
         mid = tk.Frame(self.window, bg="#1e1e1e")
         mid.pack(fill="both", expand=True, padx=14, pady=(0, 8))
 
@@ -314,6 +348,9 @@ class DownloadManagerWindow:
         self.folder_var = tk.StringVar(value=str(BACKUP_DOWNLOAD_FOLDER))
         tk.Entry(bottom_frame, textvariable=self.folder_var, width=48, bg="#2a2a2a", fg="#eee", insertbackground="#80d4ff").pack(side="left", padx=8, fill="x", expand=True)
         tk.Button(bottom_frame, text="Browse", command=self.browse_folder, bg="#444", fg="#eee", width=10).pack(side="left")
+        tk.Button(bottom_frame, text="Extract ZIP…", command=self.extract_zip_dialog, bg="#444", fg="#eee", width=12).pack(
+            side="left", padx=(8, 0)
+        )
 
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         threading.Thread(target=self._run_async_loop, daemon=True, name="DownloadManager-async").start()
@@ -323,6 +360,33 @@ class DownloadManagerWindow:
         folder = filedialog.askdirectory(initialdir=self.folder_var.get())
         if folder:
             self.folder_var.set(folder)
+
+    def extract_zip_dialog(self):
+        zpath = filedialog.askopenfilename(
+            initialdir=self.folder_var.get(),
+            title="Select archive",
+            filetypes=[("ZIP", "*.zip"), ("All", "*.*")],
+        )
+        if not zpath:
+            return
+        dest = filedialog.askdirectory(title="Extract to folder", initialdir=self.folder_var.get())
+        if not dest:
+            return
+        extract_zip_to(zpath, dest, log_fn=self.log)
+
+    def _reset_download_progress_ui(self):
+        try:
+            self.download_progress_var.set(0)
+            self.download_progress_label.config(text="")
+        except tk.TclError:
+            pass
+
+    def _set_download_progress_ui(self, pct: float, text: str):
+        try:
+            self.download_progress_var.set(pct)
+            self.download_progress_label.config(text=text)
+        except tk.TclError:
+            pass
 
     def clear_log(self):
         self.log_lines = []
@@ -422,15 +486,31 @@ class DownloadManagerWindow:
                 self.log(f"Starting: {save_path.name}  ({size_hint})")
 
                 chunk_size = 256 * 1024
+                downloaded = 0
 
                 with open(save_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(chunk_size):
                         if chunk:
                             f.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                pct = min(100.0, 100.0 * downloaded / total)
+                                label = f"{save_path.name}  {downloaded / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MiB"
+                                self.window.after(
+                                    0,
+                                    lambda p=pct, lb=label: self._set_download_progress_ui(p, lb),
+                                )
 
+                self.window.after(0, self._reset_download_progress_ui)
                 self.log(f"Completed → {save_path.name}")
+                try:
+                    digest = sha256_file(str(save_path))
+                    self.log(f"SHA-256: {digest}")
+                except Exception as ex:
+                    self.log(f"SHA-256 skipped: {ex}")
 
         except Exception as e:
+            self.window.after(0, self._reset_download_progress_ui)
             self.log(f"Failed {url} → {type(e).__name__}: {e}")
 
     async def worker(self):
@@ -518,6 +598,8 @@ class Launcher:
         self._last_cover_path = None
         self._cover_photo_ref = None
         self.achievements_win = None
+        self._hotkey_stop = threading.Event()
+        self._tray_setup_once = False
         self.load_user()
 
     def get_settings_path(self, profile=None):
@@ -680,18 +762,28 @@ class Launcher:
         if len(labels) > 8:
             body_lines.append(f"+{len(labels) - 8} more")
         body = "\n".join(body_lines)
+        points_total = sum(self._gamerscore_points_for_unlock_id(aid) for aid in new_ids)
+        gs_suffix = f" (+{points_total} G)" if points_total else ""
         if len(labels) == 1:
             only = next(iter(new_ids))
+            pts_one = self._gamerscore_points_for_unlock_id(only)
+            one_suffix = f" (+{pts_one} G)" if pts_one else ""
             if only in secret_id_set:
-                Toast(self.root, labels[0], duration=5500, title="Secret unlocked", title_color="#cc88ff")
+                Toast(
+                    self.root,
+                    labels[0],
+                    duration=5500,
+                    title=f"Secret unlocked{one_suffix}",
+                    title_color="#cc88ff",
+                )
             else:
-                Toast(self.root, labels[0], duration=5500, title="Achievement unlocked")
+                Toast(self.root, labels[0], duration=5500, title=f"Achievement unlocked{one_suffix}")
         elif all_secret:
             title = "Secrets unlocked" if len(new_ids) > 1 else "Secret unlocked"
-            Toast(self.root, body, duration=6000, title=title, title_color="#cc88ff")
+            Toast(self.root, body, duration=6000, title=f"{title}{gs_suffix}", title_color="#cc88ff")
         else:
             title = "Achievements unlocked" if len(new_ids) > 1 else "Achievement unlocked"
-            Toast(self.root, body, duration=5500, title=title)
+            Toast(self.root, body, duration=5500, title=f"{title}{gs_suffix}")
 
     def _check_achievements_unlock(self):
         """Run on the main thread; compares launcher-only playtime to thresholds."""
@@ -895,10 +987,11 @@ class Launcher:
             tk.Label(txt, text=desc, bg="#2a2a2a", fg="#bbbbbb" if ok else "#777777", font=("", 9), anchor="w", wraplength=620, justify="left").pack(anchor="w")
             need_str = self._format_achievement_seconds(need_sec)
             have_str = self._format_achievement_seconds(total)
+            rare = fake_rarity_percent(aid)
             if ok:
-                prog = f"Unlocked · {gp} G"
+                prog = f"Unlocked · {gp} G · ~{rare}% (local est.)"
             else:
-                prog = f"Requires {need_str} total (have {have_str}) · {gp} G"
+                prog = f"Requires {need_str} total (have {have_str}) · {gp} G · ~{rare}% (local est.)"
             tk.Label(row, text=prog, bg="#2a2a2a", fg="#888888", font=("", 9)).pack(side="right", padx=(8, 0))
 
         tk.Label(
@@ -946,10 +1039,11 @@ class Launcher:
                     tk.Label(txt, text=desc, bg="#252525", fg="#999999", font=("", 8), anchor="w", wraplength=580, justify="left").pack(anchor="w")
                     need_str = self._format_achievement_seconds(need_sec)
                     have_str = self._format_achievement_seconds(lp)
+                    rare = fake_rarity_percent(aid)
                     if ok:
-                        prog = f"Unlocked · {gp} G"
+                        prog = f"Unlocked · {gp} G · ~{rare}% (local est.)"
                     else:
-                        prog = f"Requires {need_str} (have {have_str}) · {gp} G"
+                        prog = f"Requires {need_str} (have {have_str}) · {gp} G · ~{rare}% (local est.)"
                     tk.Label(row, text=prog, bg="#252525", fg="#777777", font=("", 8)).pack(side="right", padx=(6, 0))
 
         counts, secs = self._launcher_platform_stats()
@@ -983,7 +1077,13 @@ class Launcher:
             if ok:
                 tk.Label(txt, text=title, bg="#2a1f35", fg="#f0e0ff", font=("", 11, "bold"), anchor="w").pack(anchor="w")
                 tk.Label(txt, text=desc, bg="#2a1f35", fg="#cbb0dd", font=("", 9), anchor="w", wraplength=620, justify="left").pack(anchor="w")
-                tk.Label(row, text=f"Unlocked · {gp} G", bg="#2a1f35", fg="#9988aa", font=("", 9)).pack(side="right", padx=(8, 0))
+                tk.Label(
+                    row,
+                    text=f"Unlocked · {gp} G · ~{fake_rarity_percent(aid)}% (local est.)",
+                    bg="#2a1f35",
+                    fg="#9988aa",
+                    font=("", 9),
+                ).pack(side="right", padx=(8, 0))
             else:
                 tk.Label(txt, text="???", bg="#2a1f35", fg="#887788", font=("", 11, "bold"), anchor="w").pack(anchor="w")
                 tk.Label(
@@ -996,7 +1096,13 @@ class Launcher:
                     wraplength=620,
                     justify="left",
                 ).pack(anchor="w")
-                tk.Label(row, text=f"Locked · {gp} G", bg="#2a1f35", fg="#554455", font=("", 9)).pack(side="right", padx=(8, 0))
+                tk.Label(
+                    row,
+                    text=f"Locked · {gp} G · ~{fake_rarity_percent(aid)}% (local est.)",
+                    bg="#2a1f35",
+                    fg="#554455",
+                    font=("", 9),
+                ).pack(side="right", padx=(8, 0))
 
     @staticmethod
     def _steam_cache_incomplete(loaded):
@@ -1043,11 +1149,14 @@ class Launcher:
 
     def save(self, fullpath, data):
         try:
-            os.makedirs(os.path.dirname(fullpath), exist_ok=True)
-            with open(fullpath, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-        except:
-            pass
+            atomic_write_json(fullpath, data)
+        except Exception:
+            try:
+                os.makedirs(os.path.dirname(fullpath), exist_ok=True)
+                with open(fullpath, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4)
+            except Exception:
+                pass
 
     def load_user(self):
         user_data = self.load(os.path.join(DIR, "user.json"))
@@ -1070,6 +1179,8 @@ class Launcher:
             self.show_login_screen()
 
     def show_login_screen(self):
+        self._tray_setup_once = False
+        self._stop_tray_hotkey()
         for w in self.root.winfo_children():
             w.destroy()
 
@@ -1148,6 +1259,12 @@ class Launcher:
             "auto_refresh": True,
             "show_toast": True,
             "notify_achievements": True,
+            "portable_mode": False,
+            "idle_pause_enabled": False,
+            "steam_metadata_only": False,
+            "minimize_to_tray": False,
+            "igdb_client_id": "",
+            "igdb_client_secret": "",
             "enable_logging": False,
             "recently_played_format": "date_time",
             "last_steamid64": "",
@@ -1174,6 +1291,28 @@ class Launcher:
         self.show_toast = settings.get("show_toast", True)
         self.notify_achievements_var = tk.BooleanVar(value=settings.get("notify_achievements", True))
         self.notify_achievements = self.notify_achievements_var.get()
+        self.portable_mode_var = tk.BooleanVar(value=settings.get("portable_mode", False))
+        self.idle_pause_var = tk.BooleanVar(value=settings.get("idle_pause_enabled", False))
+        self.steam_metadata_only_var = tk.BooleanVar(value=settings.get("steam_metadata_only", False))
+        self.minimize_to_tray_var = tk.BooleanVar(value=settings.get("minimize_to_tray", False))
+        self.portable_mode = self.portable_mode_var.get()
+        self.idle_pause_enabled = self.idle_pause_var.get()
+        self.steam_metadata_only = self.steam_metadata_only_var.get()
+        self.minimize_to_tray = self.minimize_to_tray_var.get()
+
+        def _sync_pref_vars(*_):
+            self.portable_mode = self.portable_mode_var.get()
+            self.idle_pause_enabled = self.idle_pause_var.get()
+            self.steam_metadata_only = self.steam_metadata_only_var.get()
+            self.minimize_to_tray = self.minimize_to_tray_var.get()
+
+        self._sync_pref_vars = _sync_pref_vars
+        self.portable_mode_var.trace_add("write", lambda *a: _sync_pref_vars())
+        self.idle_pause_var.trace_add("write", lambda *a: _sync_pref_vars())
+        self.steam_metadata_only_var.trace_add("write", lambda *a: _sync_pref_vars())
+        self.minimize_to_tray_var.trace_add("write", lambda *a: _sync_pref_vars())
+        self.igdb_client_id = settings.get("igdb_client_id", "")
+        self.igdb_client_secret = settings.get("igdb_client_secret", "")
         self.enable_logging = settings.get("enable_logging", False)
         self.recent_format = settings.get("recently_played_format", "date_time")
         self.last_steamid64 = settings.get("last_steamid64", "")
@@ -1189,10 +1328,7 @@ class Launcher:
         self.games = self.load(os.path.join(DIR, f"{self.current}_games.json"), default=[])
         self._migrate_games()
 
-        self.states = {
-            g["name"]: {"running": False, "start_time": None, "session_duration": timedelta(0)}
-            for g in self.games
-        }
+        self.states = {g["name"]: self._default_play_state() for g in self.games}
 
         self.cache = {}
         for g in self.games:
@@ -1337,31 +1473,47 @@ class Launcher:
 
         tk.Label(filter_frame, text="Search:", bg="#1e1e1e", fg="#fff").pack(side="left")
         self.search_var = tk.StringVar(value=settings.get("last_search_text", ""))
-        search_entry = tk.Entry(filter_frame, textvariable=self.search_var, bg="#2a2a2a", fg="#fff", insertbackground="#fff")
-        search_entry.pack(side="left", fill="x", expand=True, padx=(5, 20))
-        search_entry.bind("<KeyRelease>", lambda e: self.apply_filters())
+        self.search_entry = tk.Entry(
+            filter_frame, textvariable=self.search_var, bg="#2a2a2a", fg="#fff", insertbackground="#fff"
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(5, 20))
+        self.search_entry.bind("<KeyRelease>", lambda e: self.apply_filters())
 
         tk.Label(filter_frame, text="Sort:", bg="#1e1e1e", fg="#fff").pack(side="left")
         self.sort_var = tk.StringVar(value=settings.get("last_sort_mode", "Name"))
-        sort_menu = ttk.Combobox(filter_frame, textvariable=self.sort_var,
-                                 values=["Name", "Recently Played", "Playtime", "Favorites"],
-                                 state="readonly", width=15)
+        sort_menu = ttk.Combobox(
+            filter_frame,
+            textvariable=self.sort_var,
+            values=[
+                "Name",
+                "Recently Played",
+                "Continue",
+                "Short sessions",
+                "Long hauls",
+                "Playtime",
+                "Favorites",
+            ],
+            state="readonly",
+            width=18,
+        )
         sort_menu.pack(side="left", padx=(5, 0))
         sort_menu.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
 
-        columns = ("name", "platform", "playtime", "favorite", "recent")
+        columns = ("name", "platform", "health", "playtime", "favorite", "recent")
         self.tree = ttk.Treeview(self.list_frame, columns=columns, show="headings", selectmode="browse")
         self.tree.heading("name", text="Name", command=lambda: self.sort_by_column("name"))
         self.tree.heading("platform", text="Platform", command=lambda: self.sort_by_column("platform"))
+        self.tree.heading("health", text="Path", command=lambda: self.sort_by_column("health"))
         self.tree.heading("playtime", text="Playtime", command=lambda: self.sort_by_column("playtime"))
         self.tree.heading("favorite", text="★", command=lambda: self.sort_by_column("favorite"))
         self.tree.heading("recent", text="Recently Played", command=lambda: self.sort_by_column("recent"))
 
-        self.tree.column("name", width=420, minwidth=140, anchor="w", stretch=True)
-        self.tree.column("platform", width=100, minwidth=72, anchor="center", stretch=False)
-        self.tree.column("playtime", width=96, minwidth=72, anchor="center", stretch=False)
+        self.tree.column("name", width=360, minwidth=140, anchor="w", stretch=True)
+        self.tree.column("platform", width=88, minwidth=72, anchor="center", stretch=False)
+        self.tree.column("health", width=44, minwidth=36, anchor="center", stretch=False)
+        self.tree.column("playtime", width=108, minwidth=80, anchor="center", stretch=False)
         self.tree.column("favorite", width=44, minwidth=36, anchor="center", stretch=False)
-        self.tree.column("recent", width=160, minwidth=120, anchor="center", stretch=False)
+        self.tree.column("recent", width=150, minwidth=120, anchor="center", stretch=False)
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -1377,6 +1529,11 @@ class Launcher:
         self.tree.bind("<Double-1>", lambda e: self.launch())
         self.context_menu = tk.Menu(self.root, tearoff=0, bg="#333", fg="#fff")
         self.context_menu.add_command(label="Toggle Favorite", command=self.toggle_favorite)
+        self.context_menu.add_command(label="Launch", command=self.launch)
+        self.context_menu.add_command(label="Open folder", command=self.open_selected_game_folder)
+        self.context_menu.add_command(label="Notes…", command=self.edit_notes_selected)
+        self.context_menu.add_command(label="Executable targets…", command=self.pick_executable_dialog)
+        self.context_menu.add_command(label="Fetch IGDB metadata", command=self.fetch_igdb_selected)
         self.context_menu.add_command(label="Refresh Info", command=self.refresh_selected_info)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Remove", command=self.remove)
@@ -1458,8 +1615,12 @@ class Launcher:
 
         self.root.bind("<Return>", lambda e: self.launch())
         self.root.bind("<Delete>", lambda e: self.remove())
-        self.root.bind("<Control-f>", lambda e: search_entry.focus_set())
+        self.root.bind("<Control-f>", lambda e: self.search_entry.focus_set())
         self.root.bind("<Control-a>", lambda e: self.handle_add_dropdown(self.add_var.get()))
+        self.root.bind("<Control-k>", lambda e: self.open_command_palette())
+        self.root.bind("<slash>", lambda e: self.open_command_palette())
+        self.tree.bind("<Home>", self._on_tree_home)
+        self.tree.bind("<End>", self._on_tree_end)
 
         self.menu()
         self.apply_filters()
@@ -1482,6 +1643,9 @@ class Launcher:
         threading.Thread(target=self.global_playtime_tracker, daemon=True).start()
         self.root.after(500, self._check_achievements_unlock)
         self.update_gamerscore_label()
+        self._tray_icon = None
+        self._hotkey_stop.clear()
+        self.root.after(800, self._setup_tray_and_hotkey)
 
     def center_window(self):
         self.root.update_idletasks()
@@ -1652,6 +1816,24 @@ class Launcher:
                 settings["notify_achievements"] = self.notify_achievements_var.get()
             else:
                 settings["notify_achievements"] = getattr(self, "notify_achievements", True)
+            settings["portable_mode"] = (
+                self.portable_mode_var.get() if hasattr(self, "portable_mode_var") else getattr(self, "portable_mode", False)
+            )
+            settings["idle_pause_enabled"] = (
+                self.idle_pause_var.get() if hasattr(self, "idle_pause_var") else getattr(self, "idle_pause_enabled", False)
+            )
+            settings["steam_metadata_only"] = (
+                self.steam_metadata_only_var.get()
+                if hasattr(self, "steam_metadata_only_var")
+                else getattr(self, "steam_metadata_only", False)
+            )
+            settings["minimize_to_tray"] = (
+                self.minimize_to_tray_var.get()
+                if hasattr(self, "minimize_to_tray_var")
+                else getattr(self, "minimize_to_tray", False)
+            )
+            settings["igdb_client_id"] = getattr(self, "igdb_client_id", "")
+            settings["igdb_client_secret"] = getattr(self, "igdb_client_secret", "")
             self.save(settings_path, settings)
             self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
         except Exception:
@@ -1659,7 +1841,49 @@ class Launcher:
 
     def on_close(self):
         self.persist_current_profile_state()
-        self.root.destroy()
+        if (
+            getattr(self, "minimize_to_tray", False)
+            and getattr(self, "_tray_icon", None) is not None
+        ):
+            try:
+                self.root.withdraw()
+                return
+            except tk.TclError:
+                pass
+        self._stop_tray_hotkey()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def show_main_window(self):
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def quit_fully(self):
+        self.persist_current_profile_state()
+        self._stop_tray_hotkey()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _stop_tray_hotkey(self):
+        try:
+            self._hotkey_stop.set()
+        except Exception:
+            pass
+        icon = getattr(self, "_tray_icon", None)
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
 
     def reset_window_to_default(self):
         self._default_main_geometry()
@@ -1698,8 +1922,49 @@ class Launcher:
             if "steam_appid" not in g:
                 g["steam_appid"] = None
                 changed = True
+            if "notes" not in g:
+                g["notes"] = ""
+                changed = True
+            if "alternate_paths" not in g or not isinstance(g.get("alternate_paths"), list):
+                g["alternate_paths"] = []
+                changed = True
+            if "launch_path" not in g:
+                g["launch_path"] = None
+                changed = True
+            if "playtime_verified" not in g:
+                g["playtime_verified"] = False
+                changed = True
+            if "session_count" not in g or not isinstance(g.get("session_count"), int):
+                g["session_count"] = 0
+                changed = True
+            if "session_duration_sum_sec" not in g or not isinstance(
+                g.get("session_duration_sum_sec"), (int, float)
+            ):
+                g["session_duration_sum_sec"] = 0.0
+                changed = True
+            if "last_session_duration_sec" not in g or not isinstance(
+                g.get("last_session_duration_sec"), (int, float)
+            ):
+                g["last_session_duration_sec"] = 0.0
+                changed = True
+            if "igdb_genres" not in g:
+                g["igdb_genres"] = ""
+                changed = True
+            if "igdb_year" not in g:
+                g["igdb_year"] = None
+                changed = True
         if changed:
             self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+
+    @staticmethod
+    def _default_play_state():
+        return {
+            "running": False,
+            "start_time": None,
+            "session_duration": timedelta(0),
+            "idle_flagged": False,
+            "cumulative_active_sec": 0,
+        }
 
     def restore_last_selection(self):
         settings_path = self.get_settings_path()
@@ -1746,6 +2011,34 @@ class Launcher:
                 self.select(None)
         return "break"
 
+    def _on_tree_home(self, event):
+        ch = self.tree.get_children()
+        if ch:
+            self.tree.selection_set(ch[0])
+            self.tree.focus(ch[0])
+            self.tree.see(ch[0])
+            self.select(None)
+        return "break"
+
+    def _on_tree_end(self, event):
+        ch = self.tree.get_children()
+        if ch:
+            last = ch[-1]
+            self.tree.selection_set(last)
+            self.tree.focus(last)
+            self.tree.see(last)
+            self.select(None)
+        return "break"
+
+    def _last_launch_ts(self, g):
+        ll = g.get("last_launch")
+        if not ll or not isinstance(ll, str):
+            return 0.0
+        try:
+            return datetime.strptime(ll, "%Y-%m-%d %H:%M:%S").timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+
     def apply_filters(self):
         selected_iid = self.tree.selection()
         old_iid = selected_iid[0] if selected_iid else None
@@ -1765,6 +2058,25 @@ class Launcher:
         elif sort_mode == "Recently Played":
             key = lambda x: x.get("last_launch") or "0000-00-00 00:00:00"
             reverse = True
+        elif sort_mode == "Continue":
+
+            def key(x):
+                ts = self._last_launch_ts(x)
+                short = float(x.get("last_session_duration_sec") or 0) < 900
+                return (0 if short else 1, -ts)
+
+            reverse = False
+        elif sort_mode == "Short sessions":
+
+            def key(x):
+                c = float(x.get("session_count") or 0)
+                s = float(x.get("session_duration_sum_sec") or 0)
+                return s / max(c, 1.0)
+
+            reverse = False
+        elif sort_mode == "Long hauls":
+            key = lambda x: float(x.get("launcher_playtime_seconds") or x.get("playtime") or 0)
+            reverse = True
         elif sort_mode == "Playtime":
             key = lambda x: x.get("playtime", 0)
             reverse = True
@@ -1779,7 +2091,6 @@ class Launcher:
             self.tree.delete(item)
 
         for g in filtered_games:
-            playtime_str = self.format_playtime(g.get("playtime", 0))
             fav_text = "★" if g.get("favorite", False) else ""
             last = g.get("last_launch")
             recent_text = "-"
@@ -1805,13 +2116,26 @@ class Launcher:
 
             orig_idx = self.games.index(g)
             iid = str(orig_idx)
-            self.tree.insert("", "end", iid=iid, values=(
-                g["name"],
-                self.get_platform(g["path"]),
-                playtime_str,
-                fav_text,
-                recent_text
-            ))
+            pt = self.format_playtime(g.get("playtime", 0))
+            if g.get("playtime_verified") and pt != "-":
+                playtime_str = f"{pt} ✓"
+            elif g.get("playtime_verified"):
+                playtime_str = "✓"
+            else:
+                playtime_str = pt
+            self.tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    g["name"],
+                    self.get_platform(g["path"]),
+                    self._game_path_health_symbol(g),
+                    playtime_str,
+                    fav_text,
+                    recent_text,
+                ),
+            )
 
         self.update_status_bar()
 
@@ -1858,9 +2182,10 @@ class Launcher:
         mapping = {
             "name": "Name",
             "platform": "Platform",
+            "health": "Name",
             "playtime": "Playtime",
             "favorite": "Favorites",
-            "recent": "Recently Played"
+            "recent": "Recently Played",
         }
         self.sort_var.set(mapping.get(col, "Name"))
         self.apply_filters()
@@ -1891,8 +2216,47 @@ class Launcher:
         else:
             return f"{s}s"
 
+    def _resolve_game_path(self, p):
+        if not p:
+            return p
+        if getattr(self, "portable_mode", False):
+            return resolve_portable_path(BASE_DIR, p)
+        try:
+            return os.path.normpath(p)
+        except Exception:
+            return p
+
+    def _game_executable_paths(self, game):
+        seen = set()
+        out = []
+        for key in ("launch_path", "path"):
+            v = game.get(key)
+            if v:
+                n = os.path.normpath(self._resolve_game_path(v)).lower()
+                if n not in seen:
+                    seen.add(n)
+                    out.append(v)
+        for a in game.get("alternate_paths") or []:
+            if a:
+                n = os.path.normpath(self._resolve_game_path(a)).lower()
+                if n not in seen:
+                    seen.add(n)
+                    out.append(a)
+        return out
+
+    def _game_path_health_symbol(self, game):
+        p = self._resolve_game_path(game.get("path") or "")
+        plat = self.get_platform(game.get("path"))
+        if p and os.path.isfile(p):
+            return "●"
+        if plat == "Xbox" and p:
+            folder = os.path.dirname(p)
+            if os.path.isdir(folder):
+                return "◐"
+        return "○"
+
     def get_platform(self, path):
-        path_lower = path.lower()
+        path_lower = (path or "").lower()
         if "steam" in path_lower and "steamapps" in path_lower:
             return "Steam"
         elif "xboxgames" in path_lower:
@@ -2241,12 +2605,28 @@ class Launcher:
             "description": "Loading... (refresh if needed)",
             "appid": None
         })
+        details = cache_info.get("details", "") or ""
+        meta_bits = []
+        if game.get("igdb_year"):
+            meta_bits.append(f"Year (IGDB): {game['igdb_year']}")
+        if game.get("igdb_genres"):
+            meta_bits.append(f"Genres (IGDB): {game['igdb_genres']}")
+        if meta_bits:
+            details = (details + "\n\n" + "\n".join(meta_bits)).strip()
+        if game.get("notes"):
+            details = (details + "\n\n— Notes —\n" + str(game["notes"])).strip()
         self.show(
             cache_info.get("image", PLACE),
             cache_info.get("title", game["name"]),
-            cache_info.get("details", ""),
+            details,
             cache_info.get("description", "Loading...")
         )
+
+    def _primary_launch_exe(self, game):
+        lp = game.get("launch_path")
+        if lp:
+            return self._resolve_game_path(lp)
+        return self._resolve_game_path(game.get("path") or "")
 
     def launch(self):
         sel = self.tree.selection()
@@ -2255,7 +2635,7 @@ class Launcher:
         idx = int(sel[0])
         game = self.games[idx]
         platform = self.get_platform(game["path"])
-        game_name = game["name"]
+        exe = self._primary_launch_exe(game)
         p = None
         try:
             if platform == "Steam":
@@ -2263,9 +2643,27 @@ class Launcher:
                 if appid:
                     webbrowser.open(f"steam://run/{appid}")
                 else:
-                    p = subprocess.Popen([game["path"]], cwd=os.path.dirname(game["path"]))
+                    if not exe or not os.path.isfile(exe):
+                        raise FileNotFoundError("Steam app id missing and executable not found")
+                    cwd = os.path.dirname(exe) or "."
+                    p = subprocess.Popen([exe], cwd=cwd)
             else:
-                p = subprocess.Popen([game["path"]], cwd=os.path.dirname(game["path"]))
+                if not exe or not os.path.isfile(exe):
+                    raise FileNotFoundError(f"Executable not found: {exe}")
+                cwd = os.path.dirname(exe) or "."
+                p = subprocess.Popen([exe], cwd=cwd)
+
+            run_plugin_hooks(
+                "launch",
+                PLUGIN_DIR,
+                {
+                    "profile": self.current,
+                    "game": game,
+                    "exe": exe,
+                    "cwd": os.path.dirname(exe) if exe else "",
+                },
+                log_fn=lambda m: logging.info(m) if getattr(self, "enable_logging", False) else None,
+            )
 
             self.current_game_process = p
             now = datetime.now()
@@ -2284,52 +2682,169 @@ class Launcher:
         except Exception as e:
             messagebox.showerror("Launch Error", f"Failed to launch {game['name']}\n{str(e)}")
 
+    def _session_end_hooks(
+        self,
+        game,
+        duration_sec,
+        session_verified,
+    ):
+        """Append logs, plugins, seasonal — called from tracker thread; marshals UI toasts to main thread."""
+        try:
+            append_session_record(
+                DIR,
+                self.current,
+                {
+                    "game": game.get("name"),
+                    "profile": self.current,
+                    "duration_sec": round(duration_sec, 2),
+                    "verified_continuous": session_verified,
+                    "ended_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+        except Exception:
+            pass
+        try:
+            day = datetime.now().strftime("%Y-%m-%d")
+            append_captains_entry(
+                DIR,
+                self.current,
+                day,
+                f"{datetime.now():%b %d}: {game['name']} — {self.format_duration(duration_sec)} at sea.",
+            )
+        except Exception:
+            pass
+        try:
+            st = load_seasonal(DIR, self.current)
+            wk = iso_week_id()
+            if st.get("week") != wk:
+                st = {"week": wk, "platforms_played": [], "challenge_done": False}
+            plat = self.get_platform(game.get("path"))
+            pp = list(st.get("platforms_played") or [])
+            if plat not in pp:
+                pp.append(plat)
+            st["platforms_played"] = pp
+            uniq = {p for p in pp if p in ("Steam", "Xbox", "Pirated")}
+            if len(uniq) >= 3 and not st.get("challenge_done"):
+                st["challenge_done"] = True
+                self.update_queue.put(
+                    lambda: Toast(
+                        self.root,
+                        "Weekly challenge: played 3 different platforms — bonus badge unlocked (local).",
+                        5000,
+                        title="Seasonal",
+                    )
+                )
+            save_seasonal(DIR, self.current, st)
+        except Exception:
+            pass
+        try:
+            run_plugin_hooks(
+                "session_end",
+                PLUGIN_DIR,
+                {
+                    "profile": self.current,
+                    "game": game,
+                    "duration_sec": duration_sec,
+                    "verified_continuous": session_verified,
+                    "path": game.get("path"),
+                },
+                log_fn=lambda m: logging.info(m) if getattr(self, "enable_logging", False) else None,
+            )
+        except Exception:
+            pass
+
     def global_playtime_tracker(self):
         while True:
             updated = False
             running_paths = set()
-            for proc in psutil.process_iter(['exe', 'cmdline']):
+            for proc in psutil.process_iter(["exe", "cmdline"]):
                 try:
-                    exe = proc.info['exe']
+                    exe = proc.info.get("exe")
                     if exe:
                         running_paths.add(os.path.normpath(exe).lower())
-                    cmd = ' '.join(proc.info['cmdline'] or []).lower()
+                    cmd = " ".join(proc.info.get("cmdline") or []).lower()
                     if cmd:
                         for g in self.games:
-                            target = os.path.normpath(g['path']).lower()
-                            if target in cmd:
-                                running_paths.add(target)
-                except:
+                            for raw in self._game_executable_paths(g):
+                                target = os.path.normpath(self._resolve_game_path(raw)).lower()
+                                if target and target in cmd:
+                                    running_paths.add(target)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+                except Exception:
+                    pass
+
+            idle_pause = getattr(self, "idle_pause_enabled", False)
+            idle_sec = windows_idle_seconds() if idle_pause else None
+            is_idle = bool(idle_pause and idle_sec is not None and idle_sec > 120.0)
 
             active_game = None
             active_duration = timedelta(0)
+
             for game in self.games:
-                target_path = os.path.normpath(game['path']).lower()
-                is_running = target_path in running_paths
-                state = self.states[game['name']]
+                paths_set = set()
+                for raw in self._game_executable_paths(game):
+                    rp = self._resolve_game_path(raw)
+                    if rp:
+                        paths_set.add(os.path.normpath(rp).lower())
+                is_running = bool(paths_set & running_paths)
+                state = self.states.setdefault(game["name"], self._default_play_state())
+
                 if is_running:
-                    if not state['running']:
-                        state['start_time'] = datetime.now()
-                        state['running'] = True
-                        game['last_launch'] = state['start_time'].strftime("%Y-%m-%d %H:%M:%S")
+                    if not state["running"]:
+                        state["start_time"] = datetime.now()
+                        state["running"] = True
+                        state["cumulative_active_sec"] = 0
+                        state["idle_flagged"] = False
+                        game["last_launch"] = state["start_time"].strftime("%Y-%m-%d %H:%M:%S")
                         updated = True
-                    state['session_duration'] = datetime.now() - state['start_time']
-                    if not active_game or state['start_time'] > (self.states.get(active_game, {}).get('start_time') or datetime.min):
-                        active_game = game['name']
-                        active_duration = state['session_duration']
+                    if is_idle:
+                        state["idle_flagged"] = True
+                    else:
+                        state["cumulative_active_sec"] = float(state.get("cumulative_active_sec") or 0) + 1.0
+                    live_sec = float(state.get("cumulative_active_sec") or 0)
+                    state["session_duration"] = timedelta(seconds=live_sec)
+                    st_t = state.get("start_time") or datetime.min
+                    if not active_game or st_t > (
+                        self.states.get(active_game, {}).get("start_time") or datetime.min
+                    ):
+                        active_game = game["name"]
+                        active_duration = state["session_duration"]
                 else:
-                    if state['running']:
-                        duration_sec = (datetime.now() - state['start_time']).total_seconds()
-                        game['playtime'] += duration_sec
-                        game['launcher_playtime_seconds'] = float(game.get('launcher_playtime_seconds') or 0) + duration_sec
-                        state['running'] = False
-                        state['start_time'] = None
-                        state['session_duration'] = timedelta(0)
+                    if state["running"]:
+                        duration_sec = float(state.get("cumulative_active_sec") or 0)
+                        session_verified = not bool(state.get("idle_flagged"))
+                        game["playtime"] = float(game.get("playtime") or 0) + duration_sec
+                        game["launcher_playtime_seconds"] = float(
+                            game.get("launcher_playtime_seconds") or 0
+                        ) + duration_sec
+                        game["playtime_verified"] = session_verified
+                        game["session_count"] = int(game.get("session_count") or 0) + 1
+                        game["session_duration_sum_sec"] = float(
+                            game.get("session_duration_sum_sec") or 0
+                        ) + duration_sec
+                        game["last_session_duration_sec"] = duration_sec
+                        state["running"] = False
+                        state["start_time"] = None
+                        state["session_duration"] = timedelta(0)
+                        state["cumulative_active_sec"] = 0
+                        state["idle_flagged"] = False
                         updated = True
+                        if duration_sec > 0:
+                            self._session_end_hooks(game, duration_sec, session_verified)
                         if self.show_toast and duration_sec > 0:
-                            Toast(self.root, f"Playtime added for {game['name']}: +{self.format_playtime(duration_sec)}")
-                        self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+
+                            def _toast_play():
+                                Toast(
+                                    self.root,
+                                    f"Playtime added for {game['name']}: +{self.format_playtime(duration_sec)}",
+                                )
+
+                            self.update_queue.put(_toast_play)
+                        try:
+                            self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+                        except Exception:
+                            pass
                         self.update_queue.put(self._check_achievements_unlock)
 
             if updated:
@@ -2356,9 +2871,11 @@ class Launcher:
 
                 self.update_queue.put(safe_set_playing)
             else:
+
                 def safe_clear():
                     if self.session_status_label and self.session_status_label.winfo_exists():
                         self.session_status_label.config(text="")
+
                 self.update_queue.put(safe_clear)
 
             time.sleep(1)
@@ -2414,12 +2931,17 @@ class Launcher:
         if not name or not name.strip():
             return
         name = name.strip()
-        if any(g["path"].lower() == file_path.lower() for g in self.games):
-            messagebox.showwarning("Duplicate", "This game is already in your library.")
-            return
+        store_path = file_path
+        if getattr(self, "portable_mode", False):
+            store_path = to_portable_path(BASE_DIR, file_path)
+        cand_norm = os.path.normpath(self._resolve_game_path(store_path)).lower()
+        for g in self.games:
+            if os.path.normpath(self._resolve_game_path(g.get("path") or "")).lower() == cand_norm:
+                messagebox.showwarning("Duplicate", "This game is already in your library.")
+                return
         new_game = {
             "name": name,
-            "path": file_path,
+            "path": store_path,
             "playtime": 0.0,
             "launcher_playtime_seconds": 0.0,
             "last_launch": None,
@@ -2429,7 +2951,8 @@ class Launcher:
             "steam_appid": None,
         }
         self.games.append(new_game)
-        self.states[new_game['name']] = {"running": False, "start_time": None, "session_duration": timedelta(0)}
+        self._migrate_games()
+        self.states[new_game["name"]] = self._default_play_state()
         self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
         self.cache[name] = {"image": PLACE, "title": name, "details": "", "description": "Loading...", "appid": None}
         self._schedule_scrape(name, False)
@@ -2504,6 +3027,31 @@ class Launcher:
         tools_menu = tk.Menu(settings_menu, tearoff=0, bg="#333", fg="#fff")
         settings_menu.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Backup downloads…", command=self.open_download_manager)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Merge duplicate entries…", command=self.merge_duplicates_dialog)
+        tools_menu.add_command(label="Export session log (CSV)…", command=self.export_sessions_dialog)
+        tools_menu.add_command(label="Export hall of fame (JSON)…", command=self.export_hall_of_fame_dialog)
+        tools_menu.add_command(label="Export profile card (PNG)…", command=self.export_profile_card_dialog)
+        tools_menu.add_command(label="IGDB API keys…", command=self.igdb_keys_dialog)
+
+        prefs_menu = tk.Menu(settings_menu, tearoff=0, bg="#333", fg="#fff")
+        settings_menu.add_cascade(label="Preferences", menu=prefs_menu)
+        prefs_menu.add_checkbutton(
+            label="Portable mode (relative paths)",
+            variable=self.portable_mode_var,
+        )
+        prefs_menu.add_checkbutton(
+            label="Idle pause (opt-in, no time after 2m idle)",
+            variable=self.idle_pause_var,
+        )
+        prefs_menu.add_checkbutton(
+            label="Steam sync: metadata only (no playtime)",
+            variable=self.steam_metadata_only_var,
+        )
+        prefs_menu.add_checkbutton(
+            label="Close to system tray",
+            variable=self.minimize_to_tray_var,
+        )
 
         settings_menu.add_separator()
         settings_menu.add_command(label="Sign Out", command=self.sign_out)
@@ -2519,6 +3067,376 @@ class Launcher:
 
     def open_download_manager(self):
         DownloadManagerWindow(self)
+
+    def open_selected_game_folder(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        g = self.games[int(sel[0])]
+        p = self._resolve_game_path(g.get("path") or "")
+        if not p:
+            messagebox.showwarning("Folder", "No path set.")
+            return
+        folder = os.path.dirname(p) if os.path.isfile(p) else p
+        if os.path.isdir(folder):
+            try:
+                os.startfile(folder)
+            except Exception as e:
+                messagebox.showerror("Folder", str(e))
+        else:
+            messagebox.showwarning("Folder", "Path not found.")
+
+    def edit_notes_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        g = self.games[int(sel[0])]
+        w = tk.Toplevel(self.root)
+        w.title(f"Notes — {g['name']}")
+        w.geometry("520x320")
+        w.configure(bg="#1e1e1e")
+        t = tk.Text(w, bg="#2a2a2a", fg="#eee", font=("", 11))
+        t.pack(fill="both", expand=True, padx=12, pady=12)
+        t.insert("1.0", g.get("notes") or "")
+
+        def save():
+            g["notes"] = t.get("1.0", "end-1c")
+            self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+            w.destroy()
+
+        bf = tk.Frame(w, bg="#1e1e1e")
+        bf.pack(fill="x", pady=8)
+        tk.Button(bf, text="Save", command=save, bg="#444", fg="#fff").pack(side="right", padx=12)
+
+    def pick_executable_dialog(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        g = self.games[int(sel[0])]
+        w = tk.Toplevel(self.root)
+        w.title("Launch targets")
+        w.geometry("560x300")
+        w.configure(bg="#1e1e1e")
+        tk.Label(w, text="Primary path (library):", bg="#1e1e1e", fg="#ccc").pack(anchor="w", padx=12, pady=(8, 2))
+        tk.Label(w, text=g.get("path") or "", bg="#1e1e1e", fg="#fff", wraplength=520).pack(anchor="w", padx=12)
+        tk.Label(w, text="Default launch exe (optional, overrides primary for Launch):", bg="#1e1e1e", fg="#ccc").pack(
+            anchor="w", padx=12, pady=(8, 2)
+        )
+        lv = tk.StringVar(value=g.get("launch_path") or "")
+        tk.Entry(w, textvariable=lv, width=72, bg="#2a2a2a", fg="#fff").pack(padx=12, fill="x")
+        tk.Label(w, text="Alternate executables (one per line):", bg="#1e1e1e", fg="#ccc").pack(anchor="w", padx=12, pady=(8, 2))
+        alt = tk.Text(w, bg="#2a2a2a", fg="#eee", height=5)
+        alt.pack(fill="both", expand=True, padx=12, pady=6)
+        alt.insert("1.0", "\n".join(g.get("alternate_paths") or []))
+
+        def save():
+            g["launch_path"] = lv.get().strip() or None
+            lines = [ln.strip() for ln in alt.get("1.0", "end-1c").splitlines() if ln.strip()]
+            g["alternate_paths"] = lines
+            self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+            self.states.setdefault(g["name"], self._default_play_state())
+            w.destroy()
+
+        tk.Button(w, text="Save", command=save, bg="#444", fg="#fff").pack(pady=10)
+
+    def fetch_igdb_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        g = self.games[int(sel[0])]
+        cid = getattr(self, "igdb_client_id", "") or ""
+        secret = getattr(self, "igdb_client_secret", "") or ""
+        if not cid or not secret:
+            messagebox.showinfo("IGDB", "Set Client ID and Secret in Tools → IGDB API keys.")
+            return
+        meta = igdb_fetch_metadata(cid, secret, g["name"])
+        if not meta:
+            messagebox.showwarning("IGDB", "No metadata returned (check keys or install requests).")
+            return
+        genres = meta.get("genres") or []
+        g["igdb_genres"] = ", ".join(
+            (x.get("name") if isinstance(x, dict) else str(x)) for x in genres
+        ) if genres else ""
+        fr = meta.get("first_release_date")
+        g["igdb_year"] = None
+        if fr is not None:
+            try:
+                g["igdb_year"] = datetime.fromtimestamp(int(fr), tz=timezone.utc).year
+            except (TypeError, ValueError, OSError):
+                pass
+        summ = meta.get("summary")
+        if summ:
+            self.cache.setdefault(g["name"], {})
+            self.cache[g["name"]]["description"] = summ[:4000]
+        self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+        self.apply_filters()
+        Toast(self.root, "IGDB metadata applied")
+
+    def igdb_keys_dialog(self):
+        d = tk.Toplevel(self.root)
+        d.title("IGDB API keys")
+        d.geometry("480x220")
+        d.configure(bg="#1e1e1e")
+        tk.Label(d, text="Twitch / IGDB Client ID", bg="#1e1e1e", fg="#ccc").pack(anchor="w", padx=12, pady=(8, 2))
+        e1 = tk.Entry(d, width=60, bg="#2a2a2a", fg="#fff")
+        e1.insert(0, getattr(self, "igdb_client_id", ""))
+        e1.pack(padx=12, fill="x")
+        tk.Label(d, text="Client Secret", bg="#1e1e1e", fg="#ccc").pack(anchor="w", padx=12, pady=(8, 2))
+        e2 = tk.Entry(d, width=60, bg="#2a2a2a", fg="#fff", show="*")
+        e2.insert(0, getattr(self, "igdb_client_secret", ""))
+        e2.pack(padx=12, fill="x")
+
+        def save():
+            self.igdb_client_id = e1.get().strip()
+            self.igdb_client_secret = e2.get().strip()
+            self.persist_current_profile_state()
+            d.destroy()
+
+        tk.Button(d, text="Save", command=save, bg="#444", fg="#fff").pack(pady=12)
+
+    def export_sessions_dialog(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        n = export_sessions_csv(DIR, self.current, path)
+        Toast(self.root, f"Exported {n} session row(s)", 4000)
+
+    def export_hall_of_fame_dialog(self):
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        pl = build_hall_of_fame_payload(
+            self.current,
+            self.games,
+            list(self._load_achievements_unlocked()),
+            self._gamerscore_total(),
+        )
+        self.save(path, pl)
+        Toast(self.root, "Hall of fame exported", 3000)
+
+    def export_profile_card_dialog(self):
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png")])
+        if not path:
+            return
+        top = sorted(
+            self.games,
+            key=lambda g: float(g.get("launcher_playtime_seconds") or 0),
+            reverse=True,
+        )[:6]
+        names = [g["name"] for g in top]
+        ok = render_profile_card_png(path, self.current, self._gamerscore_total(), names)
+        if ok:
+            Toast(self.root, "Profile card saved", 3000)
+        else:
+            messagebox.showwarning("Profile card", "PNG export failed (Pillow required).")
+
+    def merge_duplicates_dialog(self):
+        buckets = defaultdict(list)
+        for i, g in enumerate(self.games):
+            key = os.path.normpath(self._resolve_game_path(g.get("path") or "")).lower()
+            if key:
+                buckets[key].append(i)
+        dup_groups = [idxs for idxs in buckets.values() if len(idxs) > 1]
+        if not dup_groups:
+            messagebox.showinfo("Merge", "No duplicate primary paths found.")
+            return
+        remove = set()
+        for idxs in dup_groups:
+            idxs = sorted(idxs)
+            gk = self.games[idxs[0]]
+            for ji in idxs[1:]:
+                remove.add(ji)
+                other = self.games[ji]
+                gk["playtime"] = float(gk.get("playtime") or 0) + float(other.get("playtime") or 0)
+                gk["launcher_playtime_seconds"] = float(gk.get("launcher_playtime_seconds") or 0) + float(
+                    other.get("launcher_playtime_seconds") or 0
+                )
+                gk["steam_imported_seconds"] = max(
+                    int(gk.get("steam_imported_seconds") or 0),
+                    int(other.get("steam_imported_seconds") or 0),
+                )
+                gk["session_count"] = int(gk.get("session_count") or 0) + int(other.get("session_count") or 0)
+                gk["session_duration_sum_sec"] = float(gk.get("session_duration_sum_sec") or 0) + float(
+                    other.get("session_duration_sum_sec") or 0
+                )
+                for ap in other.get("alternate_paths") or []:
+                    if ap and ap not in (gk.get("alternate_paths") or []):
+                        gk.setdefault("alternate_paths", []).append(ap)
+                if other.get("notes"):
+                    gk["notes"] = (gk.get("notes") or "").strip()
+                    oth = other["notes"].strip()
+                    gk["notes"] = (gk["notes"] + "\n---\n" + oth) if gk["notes"] else oth
+                if gk.get("last_launch") is None:
+                    gk["last_launch"] = other.get("last_launch")
+                elif other.get("last_launch"):
+                    gk["last_launch"] = self._merge_last_launch_prefer_newer(
+                        gk.get("last_launch"), other.get("last_launch")
+                    )
+        self.games = [g for i, g in enumerate(self.games) if i not in remove]
+        self.states = {g["name"]: self._default_play_state() for g in self.games}
+        self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+        self.apply_filters()
+        Toast(self.root, f"Removed {len(remove)} duplicate entr(y/ies)", 4000)
+
+    def _select_game_by_name(self, name):
+        if hasattr(self, "search_var"):
+            self.search_var.set("")
+            self.apply_filters()
+        for i, g in enumerate(self.games):
+            if g["name"] == name:
+                iid = str(i)
+                if iid in self.tree.get_children():
+                    self.tree.selection_set(iid)
+                    self.tree.focus(iid)
+                    self.tree.see(iid)
+                    self.select(None)
+                return True
+        return False
+
+    def open_quick_launcher(self):
+        win = tk.Toplevel(self.root)
+        win.title("Quick launch")
+        win.geometry("520x380")
+        win.configure(bg="#1e1e1e")
+        win.attributes("-topmost", True)
+        var = tk.StringVar()
+        ent = tk.Entry(win, textvariable=var, bg="#2a2a2a", fg="#fff", insertbackground="#fff", font=("", 11))
+        ent.pack(fill="x", padx=12, pady=10)
+        lb = tk.Listbox(win, bg="#2a2a2a", fg="#fff", height=14, font=("", 10))
+        lb.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        def refresh(*_):
+            lb.delete(0, tk.END)
+            q = var.get().lower()
+            for g in self.games:
+                if q in g["name"].lower():
+                    lb.insert(tk.END, g["name"])
+
+        var.trace_add("write", refresh)
+        refresh()
+
+        def do_launch(_=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            name = lb.get(sel[0])
+            win.destroy()
+            self._select_game_by_name(name)
+            self.launch()
+
+        lb.bind("<Double-1>", do_launch)
+        lb.bind("<Return>", do_launch)
+        ent.bind("<Return>", do_launch)
+        ent.focus_set()
+        win.after(100, lambda: ent.focus_set())
+
+    def open_command_palette(self):
+        win = tk.Toplevel(self.root)
+        win.title("Commands")
+        win.geometry("480x320")
+        win.configure(bg="#1e1e1e")
+        win.attributes("-topmost", True)
+        var = tk.StringVar()
+        ent = tk.Entry(win, textvariable=var, bg="#2a2a2a", fg="#fff", insertbackground="#fff", font=("", 11))
+        ent.pack(fill="x", padx=12, pady=10)
+        lb = tk.Listbox(win, bg="#2a2a2a", fg="#fff", height=12, font=("", 10))
+        lb.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        def focus_search():
+            win.destroy()
+            self.root.after(50, lambda: self.search_entry.focus_set())
+
+        actions = [
+            ("Launch selected game", lambda: (win.destroy(), self.launch())),
+            ("Toggle favorite (selected)", lambda: (win.destroy(), self.toggle_favorite())),
+            ("Open game folder (selected)", lambda: (win.destroy(), self.open_selected_game_folder())),
+            ("Edit notes (selected)", lambda: (win.destroy(), self.edit_notes_selected())),
+            ("Focus library search", focus_search),
+        ]
+
+        def refresh(*_):
+            lb.delete(0, tk.END)
+            q = var.get().lower()
+            for label, _fn in actions:
+                if q in label.lower():
+                    lb.insert(tk.END, label)
+
+        def run(_=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            label = lb.get(sel[0])
+            for lab, fn in actions:
+                if lab == label:
+                    fn()
+                    return
+
+        var.trace_add("write", refresh)
+        refresh()
+        lb.bind("<Double-1>", run)
+        lb.bind("<Return>", run)
+        ent.bind("<Return>", run)
+        ent.focus_set()
+
+    def _setup_tray_and_hotkey(self):
+        if self._tray_setup_once:
+            return
+        self._tray_setup_once = True
+        icon_path = os.path.join(IMG, "pirate_icon_24.png")
+        if os.path.isfile(icon_path):
+            try:
+                import pystray
+                from PIL import Image
+
+                img = Image.open(icon_path)
+
+                def on_show(_icon, _item):
+                    self.root.after(0, self.show_main_window)
+
+                def on_quick(_icon, _item):
+                    self.root.after(0, self.open_quick_launcher)
+
+                def on_quit(_icon, _item):
+                    self.root.after(0, self.quit_fully)
+
+                menu = pystray.Menu(
+                    pystray.MenuItem("Show launcher", on_show),
+                    pystray.MenuItem("Quick search", on_quick),
+                    pystray.MenuItem("Quit", on_quit),
+                )
+                self._tray_icon = pystray.Icon("pirate_launcher", img, "Pirate Launcher", menu)
+                threading.Thread(target=self._tray_icon.run, daemon=True).start()
+            except Exception:
+                self._tray_icon = None
+
+        if sys.platform == "win32":
+
+            def hotkey_loop():
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    user32 = ctypes.windll.user32
+                    MOD_CONTROL = 0x0002
+                    MOD_SHIFT = 0x0004
+                    VK_SPACE = 0x20
+                    if not user32.RegisterHotKey(None, 1, MOD_CONTROL | MOD_SHIFT, VK_SPACE):
+                        return
+                    msg = wintypes.MSG()
+                    while not self._hotkey_stop.is_set():
+                        r = user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1)
+                        if r:
+                            if msg.message == 0x0312:
+                                self.root.after(0, self.open_quick_launcher)
+                            user32.TranslateMessage(ctypes.byref(msg))
+                            user32.DispatchMessageW(ctypes.byref(msg))
+                        else:
+                            time.sleep(0.05)
+                    user32.UnregisterHotKey(None, 1)
+                except Exception:
+                    pass
+
+            threading.Thread(target=hotkey_loop, daemon=True, name="GlobalHotkey").start()
 
     def reset_playtime(self):
         if messagebox.askyesno("Reset Playtime", "Reset ALL playtime to 0 for the current profile?\nThis cannot be undone."):
@@ -2822,6 +3740,7 @@ class Launcher:
     def sync_steam_playtime(self, steamid, api_key, force_full=False):
         # force_full kept for UI compatibility; both paths now set playtime to Steam totals for matches.
         _ = force_full
+        metadata_only = getattr(self, "steam_metadata_only", False)
         url = (
             f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
             f"?key={api_key}&steamid={steamid}&format=json&include_appinfo=1&include_played_free_games=1"
@@ -2855,19 +3774,20 @@ class Launcher:
                 for game in self.games:
                     if not self._launcher_game_matches_steam_row(game, api_game):
                         continue
-                    game["playtime"] = round(api_seconds, 2)
-                    game["steam_imported_seconds"] = int(round(api_seconds))
                     aid = api_game.get("appid")
                     if aid is not None:
                         try:
                             game["steam_appid"] = int(aid)
                         except (TypeError, ValueError):
                             pass
-                    steam_ls = self._steam_rtime_to_last_launch_str(api_game)
-                    if steam_ls:
-                        game["last_launch"] = self._merge_last_launch_prefer_newer(
-                            game.get("last_launch"), steam_ls
-                        )
+                    if not metadata_only:
+                        game["playtime"] = round(api_seconds, 2)
+                        game["steam_imported_seconds"] = int(round(api_seconds))
+                        steam_ls = self._steam_rtime_to_last_launch_str(api_game)
+                        if steam_ls:
+                            game["last_launch"] = self._merge_last_launch_prefer_newer(
+                                game.get("last_launch"), steam_ls
+                            )
                     updated += 1
                     break
 
@@ -2875,11 +3795,13 @@ class Launcher:
                 self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
                 self.games = self.load(os.path.join(DIR, f"{self.current}_games.json"), default=[])
                 self._migrate_games()
-                self.states = {
-                    g["name"]: {"running": False, "start_time": None, "session_duration": timedelta(0)}
-                    for g in self.games
-                }
+                self.states = {g["name"]: self._default_play_state() for g in self.games}
                 self.apply_filters()
+                if metadata_only:
+                    return (
+                        f"Success! Matched {updated} game(s) — Steam app IDs updated only "
+                        "(metadata-only mode: playtime not changed)."
+                    )
                 return (
                     f"Success! Updated playtime and last played (from Steam) for {updated} game(s). "
                     "Matches use Steam app id or fuzzy title. "
@@ -2905,6 +3827,7 @@ class Launcher:
 
     def sign_out(self):
         self.persist_current_profile_state()
+        self._stop_tray_hotkey()
         user_json = os.path.join(DIR, "user.json")
         if os.path.exists(user_json):
             os.remove(user_json)
