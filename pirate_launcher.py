@@ -1,6 +1,7 @@
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
+import hashlib
 import json
 import os
 import subprocess
@@ -68,8 +69,11 @@ safe_create_image((480, 640), (50, 50, 50), PLACE)
 safe_create_image((20, 20), (255, 215, 0), STAR_PLACE)
 safe_create_image((20, 20), (0, 0, 0, 0), STAR_EMPTY, mode='RGBA')
 
+PIRATED_GAMES_DIR = Path(BASE_DIR) / "Pirated Games"
+PIRATED_GAMES_DIR.mkdir(parents=True, exist_ok=True)
+
 PATHS = {
-    "pirated": BASE_DIR,
+    "pirated": str(PIRATED_GAMES_DIR),
     "steam": r"C:\Program Files (x86)\Steam\steamapps\common",
     "xbox": r"C:\XboxGames"
 }
@@ -86,10 +90,11 @@ def parse_geometry(geom_str):
         return None
 
 
-DOWNLOAD_FOLDER = Path.home() / "Downloads" / "AutoDownloads"
-DOWNLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+# Backup downloads land in the same “Pirated Games” folder as the add-game default.
+BACKUP_DOWNLOAD_FOLDER = PIRATED_GAMES_DIR
 
-URL_PATTERN = re.compile(r'https?://[^\s<>"\']+\.[a-zA-Z0-9]{2,}(/[^\s<>"\']*)?')
+# Non-capturing path group so findall returns full URLs (not just the path fragment).
+URL_PATTERN = re.compile(r'https?://[^\s<>"\']+\.[a-zA-Z0-9]{2,}(?:/[^\s<>"\']*)?')
 
 # Steam rejects bare scripts/bots without browser-like headers on many endpoints.
 _STEAM_UA = (
@@ -115,8 +120,77 @@ STEAM_IMAGE_HEADERS = {
     "Referer": "https://store.steampowered.com/",
 }
 
+# Total launcher-tracked time across the profile (sum of per-game launcher_playtime_seconds).
+PROFILE_ACHIEVEMENTS = [
+    ("profile_pt_30m", 30 * 60, "First Mate", "30 minutes total time tracked by the launcher (not Steam import)."),
+    ("profile_pt_2h", 2 * 3600, "Seasoned Sailor", "2 hours total launcher-tracked playtime."),
+    ("profile_pt_10h", 10 * 3600, "Navigator", "10 hours total launcher-tracked playtime."),
+    ("profile_pt_50h", 50 * 3600, "Captain", "50 hours total launcher-tracked playtime."),
+    ("profile_pt_200h", 200 * 3600, "Legend of the Seas", "200 hours total launcher-tracked playtime."),
+]
+# Per-game ids are suffixed with __<path_key> (see _game_achievement_key).
+GAME_ACHIEVEMENTS = [
+    ("game_pt_15m", 15 * 60, "Anchored", "15 minutes launcher-tracked in this game."),
+    ("game_pt_1h", 3600, "Deep Dive", "1 hour launcher-tracked in this game."),
+    ("game_pt_25h", 25 * 3600, "Marathon", "25 hours launcher-tracked in this game."),
+]
+
+# Minimum launcher-tracked seconds before a title counts toward platform "games played" tallies.
+SECRET_ACHIEVEMENT_MIN_SEC = 60
+
+# Secret achievements: launcher-tracked only. Tuple =
+# (id, kind, need, title, description, hint_theme_for_locked_ui)
+# kind: pirate_count | steam_count | xbox_count | pirated_hours | steam_hours | xbox_hours | triple_platform
+# need: threshold (counts or seconds); ignored for triple_platform.
+SECRET_ACHIEVEMENTS = [
+    ("secret_true_pirate", "pirate_count", 1, "True Pirate", "You played a Pirated game through the launcher — no Steam import, just sea legs.", "Pirated"),
+    ("secret_high_seas", "pirate_count", 10, "Welcome to the High Seas", "Ten Pirated titles with real launcher time — the crew is assembling.", "Pirated"),
+    ("secret_blackbeard", "pirate_count", 50, "Blackbeard", "Fifty Pirated games with tracked time — you're running a fleet.", "Pirated"),
+    ("secret_parrot_squad", "pirate_count", 25, "Parrot Squad", "Twenty-five Pirated games — the birds won't stop squawking.", "Pirated"),
+    ("secret_through_our_port", "steam_count", 1, "Through Our Port", "Oh, you like this launcher that much? First Steam game played through us.", "Steam"),
+    ("secret_onlyfans", "steam_count", 10, "OnlyFans", "Ten Steam games launched from here — you're basically subscribed to the launcher.", "Steam"),
+    ("secret_steam_armada", "steam_count", 25, "Steam Armada", "Twenty-five Steam titles with real launcher time — admiral energy.", "Steam"),
+    ("secret_steam_proxy", "steam_hours", 50 * 3600, "Steamworks by Proxy", "50+ launcher-tracked hours on Steam installs — the store is optional.", "Steam"),
+    ("secret_xbox_green", "xbox_count", 1, "Green on the Horizon", "First Xbox game tracked through the launcher — wrong green, still counts.", "Xbox"),
+    ("secret_game_pass_moment", "xbox_hours", 20 * 3600, "Rent to Own", "20+ launcher-tracked hours on Xbox paths — possession is nine tenths.", "Xbox"),
+    ("secret_buried_hours", "pirated_hours", 100 * 3600, "Buried Hours", "100+ launcher-tracked hours on Pirated paths — dig deeper.", "Pirated"),
+    ("secret_tricorn", "triple_platform", 0, "Tricorn", "Steam, Xbox, and Pirated — at least one tracked game on each. Three corners, one hat.", "Mixed"),
+    ("secret_plank_walk", "steam_count", 3, "Review Bomber", "Three Steam games through the launcher — you're leaving footprints on the deck.", "Steam"),
+    ("secret_rum_runner", "pirate_count", 5, "Rum Runner", "Five Pirated games — small cargo, big attitude.", "Pirated"),
+]
+
+# Gamerscore per achievement (difficulty / grind). Game entries use suffix before __<path_key>.
+GAMERSCORE_PROFILE_POINTS = {
+    "profile_pt_30m": 5,
+    "profile_pt_2h": 10,
+    "profile_pt_10h": 15,
+    "profile_pt_50h": 25,
+    "profile_pt_200h": 50,
+}
+GAMERSCORE_GAME_SUFFIX_POINTS = {
+    "game_pt_15m": 5,
+    "game_pt_1h": 10,
+    "game_pt_25h": 25,
+}
+GAMERSCORE_SECRET_POINTS = {
+    "secret_true_pirate": 5,
+    "secret_rum_runner": 10,
+    "secret_high_seas": 20,
+    "secret_parrot_squad": 25,
+    "secret_blackbeard": 50,
+    "secret_through_our_port": 5,
+    "secret_plank_walk": 10,
+    "secret_onlyfans": 20,
+    "secret_steam_armada": 30,
+    "secret_steam_proxy": 35,
+    "secret_xbox_green": 5,
+    "secret_game_pass_moment": 25,
+    "secret_buried_hours": 40,
+    "secret_tricorn": 30,
+}
+
 class Toast:
-    def __init__(self, master, message, duration=3500):
+    def __init__(self, master, message, duration=3500, title=None, title_color="#ffd77a"):
         self.toast = tk.Toplevel(master)
         self.toast.wm_overrideredirect(True)
         self.toast.attributes('-topmost', True)
@@ -124,21 +198,43 @@ class Toast:
         self.toast.config(bg="#0f0f0f")
         container = tk.Frame(self.toast, bg="#0f0f0f")
         container.pack(padx=14, pady=10)
-        self.label = tk.Label(
-            container,
-            text=message,
-            bg="#0f0f0f",
-            fg="#eeeeee",
-            font=("Segoe UI", 11),
-            justify="left",
-            wraplength=480
-        )
-        self.label.pack()
-        self.toast.update_idletasks()
-        req_width = self.label.winfo_reqwidth() + 48
-        req_height = self.label.winfo_reqheight() + 32
+        wrap = 480
+        if title:
+            tk.Label(
+                container,
+                text=title,
+                bg="#0f0f0f",
+                fg=title_color,
+                font=("Segoe UI", 12, "bold"),
+                justify="left",
+                wraplength=wrap,
+            ).pack(anchor="w")
+            self.label = tk.Label(
+                container,
+                text=message,
+                bg="#0f0f0f",
+                fg="#e8e8e8",
+                font=("Segoe UI", 10),
+                justify="left",
+                wraplength=wrap,
+            )
+            self.label.pack(anchor="w", pady=(6, 0))
+        else:
+            self.label = tk.Label(
+                container,
+                text=message,
+                bg="#0f0f0f",
+                fg="#eeeeee",
+                font=("Segoe UI", 11),
+                justify="left",
+                wraplength=wrap,
+            )
+            self.label.pack()
+        container.update_idletasks()
+        req_width = container.winfo_reqwidth() + 48
+        req_height = container.winfo_reqheight() + 32
         MAX_W = 580
-        MAX_H = 220
+        MAX_H = 320 if title else 220
         final_w = min(max(req_width, 220), MAX_W)
         final_h = min(max(req_height, 54), MAX_H)
         screen_w = self.toast.winfo_screenwidth()
@@ -157,10 +253,17 @@ class Toast:
         self.toast.after(duration, lambda: fade_out())
 
 class DownloadManagerWindow:
+    """Fetch backup / archive links into the launcher directory tree (daemon asyncio thread)."""
+
+    _HTTP_HEADERS = {
+        "User-Agent": _STEAM_UA,
+        "Accept": "*/*",
+    }
+
     def __init__(self, parent):
         self.parent = parent
         self.window = tk.Toplevel(parent.root)
-        self.window.title("Download Manager")
+        self.window.title("Backup downloads")
         self.window.geometry("880x620")
         self.window.minsize(780, 520)
         self.window.configure(bg="#1e1e1e")
@@ -170,32 +273,50 @@ class DownloadManagerWindow:
         self.semaphore = asyncio.Semaphore(4)
         self.active_tasks = []
         self.log_lines = []
+        self.loop = None
+        self._loop_ready = threading.Event()
 
         top_frame = tk.Frame(self.window, bg="#1e1e1e")
-        top_frame.pack(fill="x", padx=14, pady=12)
+        top_frame.pack(fill="x", padx=14, pady=(12, 6))
 
-        tk.Label(top_frame, text="Download Manager", font=("", 15, "bold"), bg="#1e1e1e", fg="#ffffff").pack(side="left")
+        tk.Label(top_frame, text="Backup downloads", font=("", 15, "bold"), bg="#1e1e1e", fg="#ffffff").pack(side="left")
 
         tk.Button(top_frame, text="Clear Log", command=self.clear_log, bg="#444", fg="#eee", width=12).pack(side="right", padx=6)
         tk.Button(top_frame, text="Paste & Download", command=self.paste_and_queue, bg="#5a7a9a", fg="#ffffff", width=16).pack(side="right", padx=6)
 
-        self.log_text = tk.Text(self.window, bg="#0f0f0f", fg="#d0d0d0", font=("", 10), wrap="word", state="disabled", height=18)
-        self.log_text.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        tk.Label(
+            self.window,
+            text=(
+                "Use this for backup copies of games to install and play from your library. "
+                "Files save to the Pirated Games folder next to this launcher (same place as Add Game → Pirated Games). "
+                "Paste http(s) links, or copy a URL to the clipboard — links are picked up automatically."
+            ),
+            bg="#1e1e1e",
+            fg="#999999",
+            font=("", 10),
+            wraplength=820,
+            justify="left",
+        ).pack(fill="x", padx=14, pady=(0, 10))
 
-        scroll = ttk.Scrollbar(self.window, orient="vertical", command=self.log_text.yview)
+        mid = tk.Frame(self.window, bg="#1e1e1e")
+        mid.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        self.log_text = tk.Text(mid, bg="#0f0f0f", fg="#d0d0d0", font=("", 10), wrap="word", state="disabled", height=18)
+        scroll = ttk.Scrollbar(mid, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True)
 
         bottom_frame = tk.Frame(self.window, bg="#1e1e1e")
         bottom_frame.pack(fill="x", padx=14, pady=10)
 
-        tk.Label(bottom_frame, text="Save folder:", bg="#1e1e1e", fg="#ccc").pack(side="left")
-        self.folder_var = tk.StringVar(value=str(DOWNLOAD_FOLDER))
+        tk.Label(bottom_frame, text="Pirated games folder:", bg="#1e1e1e", fg="#ccc").pack(side="left")
+        self.folder_var = tk.StringVar(value=str(BACKUP_DOWNLOAD_FOLDER))
         tk.Entry(bottom_frame, textvariable=self.folder_var, width=48, bg="#2a2a2a", fg="#eee", insertbackground="#80d4ff").pack(side="left", padx=8, fill="x", expand=True)
         tk.Button(bottom_frame, text="Browse", command=self.browse_folder, bg="#444", fg="#eee", width=10).pack(side="left")
 
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.window.after(600, self.start_async_loop)
+        threading.Thread(target=self._run_async_loop, daemon=True, name="DownloadManager-async").start()
         self.window.after(1200, self.check_clipboard_loop)
 
     def browse_folder(self):
@@ -210,6 +331,18 @@ class DownloadManagerWindow:
         self.log_text.config(state="disabled")
 
     def log(self, msg):
+        """Thread-safe: marshals to the Tk main thread when called from async workers."""
+        if threading.current_thread() is threading.main_thread():
+            self._log_append(msg)
+        else:
+            self.window.after(0, lambda m=msg: self._log_append(m))
+
+    def _log_append(self, msg):
+        try:
+            if not self.window.winfo_exists():
+                return
+        except tk.TclError:
+            return
         timestamp = datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {msg}\n"
         self.log_lines.append(line)
@@ -223,6 +356,12 @@ class DownloadManagerWindow:
         self.log_text.config(state="disabled")
 
     def paste_and_queue(self):
+        if not self._loop_ready.is_set():
+            self.window.after(100, self.paste_and_queue)
+            return
+        if not self.loop or not self.loop.is_running():
+            self.log("Download engine is not running.")
+            return
         try:
             text = pyperclip.paste().strip()
             if not text:
@@ -230,28 +369,45 @@ class DownloadManagerWindow:
             urls = URL_PATTERN.findall(text)
             added = 0
             for url in urls:
-                if len(url) > 15:
+                if len(url) > 12 and url.lower().startswith(("http://", "https://")):
                     asyncio.run_coroutine_threadsafe(self.download_queue.put(url), self.loop)
                     added += 1
             if added > 0:
                 self.log(f"Queued {added} link(s) from clipboard")
             else:
                 self.log("No valid download links found in clipboard")
-        except:
+        except Exception:
             self.log("Clipboard access error")
 
     async def download_file(self, session, url):
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=None)) as resp:
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
+            async with session.get(url, timeout=timeout) as resp:
                 if resp.status != 200:
                     self.log(f"[{resp.status}] {url}")
                     return
 
-                fname = Path(urlparse(url).path).name
-                if not fname or '.' not in fname:
+                disp = resp.headers.get("Content-Disposition")
+                fname = None
+                if disp and "filename=" in disp:
+                    part = disp.split("filename=", 1)[1].strip().strip('"').split(";")[0]
+                    if part:
+                        fname = Path(part).name
+                if not fname:
+                    fname = Path(urlparse(url).path).name
+                if not fname or fname in ("/", ""):
                     fname = f"download_{datetime.now():%Y%m%d_%H%M%S}"
+                elif "." not in fname:
+                    fname = f"{fname}_{datetime.now():%Y%m%d_%H%M%S}"
 
-                save_path = Path(self.folder_var.get()) / fname
+                save_dir = Path(self.folder_var.get())
+                try:
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    self.log(f"Cannot create folder {save_dir}: {e}")
+                    return
+
+                save_path = save_dir / fname
 
                 if save_path.exists():
                     stem, ext = save_path.stem, save_path.suffix
@@ -260,48 +416,62 @@ class DownloadManagerWindow:
                         i += 1
                     save_path = newpath
 
-                total = int(resp.headers.get("content-length", 0))
+                total = int(resp.headers.get("content-length", 0) or 0)
+                size_hint = f"{total / 1024 / 1024:.1f} MiB" if total > 0 else "size unknown"
 
-                self.log(f"Starting: {fname}  ({total/1024/1024:.1f} MiB)")
+                self.log(f"Starting: {save_path.name}  ({size_hint})")
 
                 chunk_size = 256 * 1024
-                downloaded = 0
 
                 with open(save_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(chunk_size):
                         if chunk:
                             f.write(chunk)
-                            downloaded += len(chunk)
 
                 self.log(f"Completed → {save_path.name}")
 
         except Exception as e:
-            self.log(f"Failed {url} → {type(e).__name__}")
+            self.log(f"Failed {url} → {type(e).__name__}: {e}")
 
     async def worker(self):
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=self._HTTP_HEADERS) as session:
             while self.running:
                 try:
                     url = await asyncio.wait_for(self.download_queue.get(), timeout=6.0)
-                    async with self.semaphore:
-                        await self.download_file(session, url)
-                    self.download_queue.task_done()
                 except asyncio.TimeoutError:
                     continue
-                except Exception as e:
-                    self.log(f"Worker error: {e}")
+                except asyncio.CancelledError:
+                    break
+                try:
+                    async with self.semaphore:
+                        await self.download_file(session, url)
+                except asyncio.CancelledError:
+                    break
+                finally:
+                    try:
+                        self.download_queue.task_done()
+                    except ValueError:
+                        pass
 
-    def start_async_loop(self):
+    def _run_async_loop(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-
         for _ in range(4):
             self.active_tasks.append(self.loop.create_task(self.worker()))
-
+        self._loop_ready.set()
         self.loop.run_forever()
 
     def check_clipboard_loop(self):
-        if not self.running or not self.window.winfo_exists():
+        if not self.running:
+            return
+        try:
+            if not self.window.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        if not self._loop_ready.is_set() or not self.loop or not self.loop.is_running():
+            self.window.after(1000, self.check_clipboard_loop)
             return
 
         try:
@@ -309,21 +479,25 @@ class DownloadManagerWindow:
             urls = URL_PATTERN.findall(text)
             if urls:
                 for url in urls:
-                    if len(url) > 15:
+                    if len(url) > 12 and url.lower().startswith(("http://", "https://")):
                         asyncio.run_coroutine_threadsafe(self.download_queue.put(url), self.loop)
                         self.log(f"Auto-detected → {url}")
-                pyperclip.copy("")  # clear clipboard after auto-download
-        except:
+                pyperclip.copy("")
+        except Exception:
             pass
 
         self.window.after(1800, self.check_clipboard_loop)
 
     def on_close(self):
         self.running = False
-        for task in self.active_tasks:
-            task.cancel()
         if self.loop and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
+
+            def shutdown():
+                for task in self.active_tasks:
+                    task.cancel()
+                self.loop.stop()
+
+            self.loop.call_soon_threadsafe(shutdown)
         self.window.destroy()
 
 class Launcher:
@@ -343,12 +517,486 @@ class Launcher:
         self._panel_resize_job = None
         self._last_cover_path = None
         self._cover_photo_ref = None
+        self.achievements_win = None
         self.load_user()
 
     def get_settings_path(self, profile=None):
         if profile is None:
             profile = self.current
         return os.path.join(DIR, f"{profile}_settings.json")
+
+    def get_achievements_path(self, profile=None):
+        if profile is None:
+            profile = self.current
+        return os.path.join(DIR, f"{profile}_achievements.json")
+
+    @staticmethod
+    def _gamerscore_points_for_unlock_id(aid):
+        if aid in GAMERSCORE_PROFILE_POINTS:
+            return GAMERSCORE_PROFILE_POINTS[aid]
+        if aid in GAMERSCORE_SECRET_POINTS:
+            return GAMERSCORE_SECRET_POINTS[aid]
+        if "__" in aid:
+            try:
+                left, _ = aid.rsplit("__", 1)
+            except ValueError:
+                return 0
+            return GAMERSCORE_GAME_SUFFIX_POINTS.get(left, 0)
+        return 0
+
+    def _gamerscore_total(self):
+        return sum(self._gamerscore_points_for_unlock_id(aid) for aid in self._load_achievements_unlocked())
+
+    def update_gamerscore_label(self):
+        if not hasattr(self, "gamerscore_var"):
+            return
+        try:
+            total = self._gamerscore_total()
+            self.gamerscore_var.set(f"{total:,} G")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _load_achievements_unlocked(self):
+        data = self.load(self.get_achievements_path(), default={})
+        if not isinstance(data, dict):
+            return set()
+        u = data.get("unlocked")
+        if isinstance(u, list):
+            return set(str(x) for x in u)
+        return set()
+
+    def _save_achievements_unlocked(self, unlocked_set):
+        self.save(self.get_achievements_path(), {"unlocked": sorted(unlocked_set)})
+
+    @staticmethod
+    def _game_achievement_key(game):
+        p = os.path.normpath((game or {}).get("path") or "").lower().encode("utf-8", errors="ignore")
+        return hashlib.sha256(p).hexdigest()[:16]
+
+    def _total_launcher_playtime_sec(self):
+        return sum(float(g.get("launcher_playtime_seconds") or 0) for g in self.games)
+
+    def _launcher_platform_stats(self):
+        """Distinct games per platform (launcher time ≥ SECRET_ACHIEVEMENT_MIN_SEC) and per-platform launcher seconds."""
+        counts = {"Pirated": 0, "Steam": 0, "Xbox": 0}
+        seconds = {"Pirated": 0.0, "Steam": 0.0, "Xbox": 0.0}
+        m = SECRET_ACHIEVEMENT_MIN_SEC
+        for g in self.games:
+            lp = float(g.get("launcher_playtime_seconds") or 0)
+            plat = self.get_platform(g["path"])
+            if plat in seconds:
+                seconds[plat] += lp
+            if lp >= m and plat in counts:
+                counts[plat] += 1
+        return counts, seconds
+
+    @staticmethod
+    def _secret_achievement_satisfied(kind, need, counts, seconds):
+        if kind == "triple_platform":
+            return all(counts[p] >= 1 for p in ("Pirated", "Steam", "Xbox"))
+        if kind == "pirate_count":
+            return counts["Pirated"] >= need
+        if kind == "steam_count":
+            return counts["Steam"] >= need
+        if kind == "xbox_count":
+            return counts["Xbox"] >= need
+        if kind == "pirated_hours":
+            return seconds["Pirated"] >= need
+        if kind == "steam_hours":
+            return seconds["Steam"] >= need
+        if kind == "xbox_hours":
+            return seconds["Xbox"] >= need
+        return False
+
+    @staticmethod
+    def _secret_locked_progress_hint(kind, counts, seconds):
+        """Vague progress for locked rows (no exact thresholds)."""
+        if kind == "triple_platform":
+            return f"Steam {counts['Steam']}, Xbox {counts['Xbox']}, Pirated {counts['Pirated']}"
+        if kind == "pirate_count":
+            return f"Pirated titles (≥1 min): {counts['Pirated']}"
+        if kind == "steam_count":
+            return f"Steam titles (≥1 min): {counts['Steam']}"
+        if kind == "xbox_count":
+            return f"Xbox titles (≥1 min): {counts['Xbox']}"
+        if kind == "pirated_hours":
+            return f"Pirated hours: {seconds['Pirated'] / 3600.0:.1f}h"
+        if kind == "steam_hours":
+            return f"Steam hours: {seconds['Steam'] / 3600.0:.1f}h"
+        if kind == "xbox_hours":
+            return f"Xbox hours: {seconds['Xbox'] / 3600.0:.1f}h"
+        return ""
+
+    def _achievement_unlock_labels(self, new_ids):
+        """Human-readable names for newly unlocked achievement ids."""
+        prof_t = {a[0]: a[2] for a in PROFILE_ACHIEVEMENTS}
+        game_t = {a[0]: a[2] for a in GAME_ACHIEVEMENTS}
+        sec_map = {x[0]: x[3] for x in SECRET_ACHIEVEMENTS}
+        out = []
+        for aid in sorted(new_ids):
+            if aid in prof_t:
+                out.append(prof_t[aid])
+            elif aid in sec_map:
+                out.append(f"{sec_map[aid]} (secret)")
+            elif "__" in aid:
+                try:
+                    left, gkey = aid.rsplit("__", 1)
+                except ValueError:
+                    out.append(str(aid))
+                    continue
+                if left in game_t:
+                    gname = None
+                    for g in self.games:
+                        if self._game_achievement_key(g) == gkey:
+                            gname = g["name"]
+                            break
+                    if gname:
+                        out.append(f"{game_t[left]} — {gname}")
+                    else:
+                        out.append(game_t[left])
+                else:
+                    out.append(str(aid))
+            else:
+                out.append(str(aid))
+        return out
+
+    def _notify_achievement_unlocks(self, new_ids):
+        """Toast + optional system beep when achievements unlock (independent of general toasts)."""
+        if not getattr(self, "notify_achievements", True):
+            return
+        new_ids = set(new_ids)
+        labels = self._achievement_unlock_labels(new_ids)
+        if not labels:
+            return
+        secret_id_set = {x[0] for x in SECRET_ACHIEVEMENTS}
+        all_secret = new_ids.issubset(secret_id_set)
+        if sys.platform == "win32":
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_OK)
+            except Exception:
+                pass
+        body_lines = labels[:8]
+        if len(labels) > 8:
+            body_lines.append(f"+{len(labels) - 8} more")
+        body = "\n".join(body_lines)
+        if len(labels) == 1:
+            only = next(iter(new_ids))
+            if only in secret_id_set:
+                Toast(self.root, labels[0], duration=5500, title="Secret unlocked", title_color="#cc88ff")
+            else:
+                Toast(self.root, labels[0], duration=5500, title="Achievement unlocked")
+        elif all_secret:
+            title = "Secrets unlocked" if len(new_ids) > 1 else "Secret unlocked"
+            Toast(self.root, body, duration=6000, title=title, title_color="#cc88ff")
+        else:
+            title = "Achievements unlocked" if len(new_ids) > 1 else "Achievement unlocked"
+            Toast(self.root, body, duration=5500, title=title)
+
+    def _check_achievements_unlock(self):
+        """Run on the main thread; compares launcher-only playtime to thresholds."""
+        if not hasattr(self, "games") or self.games is None:
+            return
+        old_un = self._load_achievements_unlocked()
+        unlocked = set(old_un)
+        total = self._total_launcher_playtime_sec()
+        for aid, need_sec, _title, _desc in PROFILE_ACHIEVEMENTS:
+            if aid not in unlocked and total >= need_sec:
+                unlocked.add(aid)
+        for g in self.games:
+            lp = float(g.get("launcher_playtime_seconds") or 0)
+            gkey = self._game_achievement_key(g)
+            for aid_suffix, need_sec, _title, _desc in GAME_ACHIEVEMENTS:
+                aid = f"{aid_suffix}__{gkey}"
+                if aid not in unlocked and lp >= need_sec:
+                    unlocked.add(aid)
+        counts, secs = self._launcher_platform_stats()
+        for aid, kind, need, _title, _desc, _hint in SECRET_ACHIEVEMENTS:
+            if aid not in unlocked and self._secret_achievement_satisfied(kind, need, counts, secs):
+                unlocked.add(aid)
+        new_ids = unlocked - old_un
+        if not new_ids:
+            return
+        self._save_achievements_unlocked(unlocked)
+        self._notify_achievement_unlocks(new_ids)
+        self.update_gamerscore_label()
+        if hasattr(self, "achievements_win") and self.achievements_win is not None:
+            try:
+                if self.achievements_win.winfo_exists():
+                    self._refresh_achievements_window()
+            except (tk.TclError, AttributeError):
+                pass
+
+    def show_achievements(self):
+        win = tk.Toplevel(self.root)
+        win.title("Achievements")
+        win.geometry("760x580")
+        win.minsize(520, 400)
+        win.configure(bg="#1e1e1e")
+        win.transient(self.root)
+        self.achievements_win = win
+
+        header = tk.Frame(win, bg="#1e1e1e")
+        header.pack(fill="x", padx=20, pady=(16, 8))
+        tk.Label(
+            header,
+            text="Launcher achievements",
+            font=("", 16, "bold"),
+            bg="#1e1e1e",
+            fg="#ffffff",
+        ).pack(anchor="w")
+        tk.Label(
+            header,
+            text="Based on time tracked while playing from this launcher. Steam-imported hours do not count.",
+            font=("", 10),
+            bg="#1e1e1e",
+            fg="#888888",
+            wraplength=700,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0)
+        scroll = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg="#1e1e1e")
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            try:
+                canvas.itemconfigure(inner_id, width=event.width)
+            except tk.TclError:
+                pass
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=scroll.set)
+
+        canvas.pack(side="left", fill="both", expand=True, padx=(20, 0), pady=(0, 16))
+        scroll.pack(side="right", fill="y", pady=(0, 16), padx=(0, 12))
+
+        self._achievements_inner = inner
+        self._achievements_canvas = canvas
+        self._achievements_header = header
+        self._achievements_scrollbar = scroll
+        self._achievements_wheel_chrome_bound = False
+        self._populate_achievements_frame(inner)
+        self._bind_achievements_mousewheel()
+
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_achievements_window(win))
+
+    def _bind_achievements_mousewheel(self):
+        """Scroll the list with the mouse wheel over the header, canvas, scrollbar, or any row (Windows: MouseWheel; Linux: buttons 4/5)."""
+        canvas = getattr(self, "_achievements_canvas", None)
+        inner = getattr(self, "_achievements_inner", None)
+        win = getattr(self, "achievements_win", None)
+        if not win or not canvas or not inner:
+            return
+        try:
+            if not win.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        def on_wheel(event):
+            if getattr(event, "delta", 0):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            elif getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+
+        def bind_wheel_subtree(widget):
+            widget.bind("<MouseWheel>", on_wheel)
+            widget.bind("<Button-4>", on_wheel)
+            widget.bind("<Button-5>", on_wheel)
+            for c in widget.winfo_children():
+                bind_wheel_subtree(c)
+
+        if not getattr(self, "_achievements_wheel_chrome_bound", False):
+            header = getattr(self, "_achievements_header", None)
+            if header is not None:
+                bind_wheel_subtree(header)
+            canvas.bind("<MouseWheel>", on_wheel)
+            canvas.bind("<Button-4>", on_wheel)
+            canvas.bind("<Button-5>", on_wheel)
+            scr = getattr(self, "_achievements_scrollbar", None)
+            if scr is not None:
+                bind_wheel_subtree(scr)
+            inner.bind("<MouseWheel>", on_wheel)
+            inner.bind("<Button-4>", on_wheel)
+            inner.bind("<Button-5>", on_wheel)
+            self._achievements_wheel_chrome_bound = True
+        for child in inner.winfo_children():
+            bind_wheel_subtree(child)
+
+    def _close_achievements_window(self, win):
+        self.achievements_win = None
+        self._achievements_wheel_chrome_bound = False
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+
+    def _refresh_achievements_window(self):
+        if not hasattr(self, "_achievements_inner") or self._achievements_inner is None:
+            return
+        for w in self._achievements_inner.winfo_children():
+            w.destroy()
+        self._populate_achievements_frame(self._achievements_inner)
+        if hasattr(self, "_achievements_canvas") and self._achievements_canvas is not None:
+            self._achievements_canvas.update_idletasks()
+            self._achievements_canvas.configure(scrollregion=self._achievements_canvas.bbox("all"))
+        self._bind_achievements_mousewheel()
+
+    @staticmethod
+    def _format_achievement_seconds(seconds):
+        s = float(seconds or 0)
+        if s <= 0:
+            return "0m"
+        return Launcher.format_playtime(s)
+
+    def _populate_achievements_frame(self, inner):
+        unlocked = self._load_achievements_unlocked()
+        total = self._total_launcher_playtime_sec()
+        gs_total = self._gamerscore_total()
+        sum_lbl = tk.Label(
+            inner,
+            text=(
+                f"Profile launcher playtime: {self._format_achievement_seconds(total)}"
+                f"  ·  Gamerscore: {gs_total:,} G"
+            ),
+            bg="#1e1e1e",
+            fg="#c8e7ff",
+            font=("", 11, "bold"),
+        )
+        sum_lbl.pack(anchor="w", pady=(0, 10))
+
+        tk.Label(
+            inner,
+            text="Profile",
+            bg="#1e1e1e",
+            fg="#aaaaaa",
+            font=("", 12, "bold"),
+        ).pack(anchor="w", pady=(8, 4))
+
+        for aid, need_sec, title, desc in PROFILE_ACHIEVEMENTS:
+            ok = aid in unlocked
+            gp = GAMERSCORE_PROFILE_POINTS.get(aid, 0)
+            row = tk.Frame(inner, bg="#2a2a2a", padx=10, pady=8)
+            row.pack(fill="x", pady=3)
+            mark = "✓" if ok else "○"
+            color = "#ffd77a" if ok else "#666666"
+            tk.Label(row, text=mark, bg="#2a2a2a", fg=color, font=("", 12), width=3).pack(side="left")
+            txt = tk.Frame(row, bg="#2a2a2a")
+            txt.pack(side="left", fill="x", expand=True)
+            tk.Label(txt, text=title, bg="#2a2a2a", fg="#eeeeee" if ok else "#999999", font=("", 11, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(txt, text=desc, bg="#2a2a2a", fg="#bbbbbb" if ok else "#777777", font=("", 9), anchor="w", wraplength=620, justify="left").pack(anchor="w")
+            need_str = self._format_achievement_seconds(need_sec)
+            have_str = self._format_achievement_seconds(total)
+            if ok:
+                prog = f"Unlocked · {gp} G"
+            else:
+                prog = f"Requires {need_str} total (have {have_str}) · {gp} G"
+            tk.Label(row, text=prog, bg="#2a2a2a", fg="#888888", font=("", 9)).pack(side="right", padx=(8, 0))
+
+        tk.Label(
+            inner,
+            text="Per game",
+            bg="#1e1e1e",
+            fg="#aaaaaa",
+            font=("", 12, "bold"),
+        ).pack(anchor="w", pady=(16, 4))
+
+        if not self.games:
+            tk.Label(inner, text="No games in this profile.", bg="#1e1e1e", fg="#777777", font=("", 10)).pack(anchor="w")
+        else:
+            for g in sorted(self.games, key=lambda x: x["name"].lower()):
+                gkey = self._game_achievement_key(g)
+                lp = float(g.get("launcher_playtime_seconds") or 0)
+                sec = tk.Frame(inner, bg="#1e1e1e")
+                sec.pack(fill="x", pady=(10, 2))
+                tk.Label(
+                    sec,
+                    text=g["name"],
+                    bg="#1e1e1e",
+                    fg="#ffffff",
+                    font=("", 11, "bold"),
+                ).pack(anchor="w")
+                tk.Label(
+                    sec,
+                    text=f"Launcher-tracked: {self._format_achievement_seconds(lp)}",
+                    bg="#1e1e1e",
+                    fg="#888888",
+                    font=("", 9),
+                ).pack(anchor="w")
+                for aid_suffix, need_sec, title, desc in GAME_ACHIEVEMENTS:
+                    aid = f"{aid_suffix}__{gkey}"
+                    ok = aid in unlocked
+                    gp = GAMERSCORE_GAME_SUFFIX_POINTS.get(aid_suffix, 0)
+                    row = tk.Frame(inner, bg="#252525", padx=10, pady=6)
+                    row.pack(fill="x", pady=2)
+                    mark = "✓" if ok else "○"
+                    color = "#ffd77a" if ok else "#666666"
+                    tk.Label(row, text=mark, bg="#252525", fg=color, font=("", 11), width=3).pack(side="left")
+                    txt = tk.Frame(row, bg="#252525")
+                    txt.pack(side="left", fill="x", expand=True)
+                    tk.Label(txt, text=title, bg="#252525", fg="#eeeeee" if ok else "#999999", font=("", 10, "bold"), anchor="w").pack(anchor="w")
+                    tk.Label(txt, text=desc, bg="#252525", fg="#999999", font=("", 8), anchor="w", wraplength=580, justify="left").pack(anchor="w")
+                    need_str = self._format_achievement_seconds(need_sec)
+                    have_str = self._format_achievement_seconds(lp)
+                    if ok:
+                        prog = f"Unlocked · {gp} G"
+                    else:
+                        prog = f"Requires {need_str} (have {have_str}) · {gp} G"
+                    tk.Label(row, text=prog, bg="#252525", fg="#777777", font=("", 8)).pack(side="right", padx=(6, 0))
+
+        counts, secs = self._launcher_platform_stats()
+        tk.Label(
+            inner,
+            text="Secret",
+            bg="#1e1e1e",
+            fg="#cc88ff",
+            font=("", 12, "bold"),
+        ).pack(anchor="w", pady=(20, 4))
+        tk.Label(
+            inner,
+            text="Hidden titles until unlocked. Counts use launcher-tracked time only (≥1 min per title).",
+            bg="#1e1e1e",
+            fg="#776688",
+            font=("", 9),
+            wraplength=620,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        for aid, kind, need, title, desc, hint in SECRET_ACHIEVEMENTS:
+            ok = aid in unlocked
+            gp = GAMERSCORE_SECRET_POINTS.get(aid, 0)
+            row = tk.Frame(inner, bg="#2a1f35", padx=10, pady=8)
+            row.pack(fill="x", pady=3)
+            mark = "✦" if ok else "?"
+            color = "#e8b4ff" if ok else "#554455"
+            tk.Label(row, text=mark, bg="#2a1f35", fg=color, font=("", 12), width=3).pack(side="left")
+            txt = tk.Frame(row, bg="#2a1f35")
+            txt.pack(side="left", fill="x", expand=True)
+            if ok:
+                tk.Label(txt, text=title, bg="#2a1f35", fg="#f0e0ff", font=("", 11, "bold"), anchor="w").pack(anchor="w")
+                tk.Label(txt, text=desc, bg="#2a1f35", fg="#cbb0dd", font=("", 9), anchor="w", wraplength=620, justify="left").pack(anchor="w")
+                tk.Label(row, text=f"Unlocked · {gp} G", bg="#2a1f35", fg="#9988aa", font=("", 9)).pack(side="right", padx=(8, 0))
+            else:
+                tk.Label(txt, text="???", bg="#2a1f35", fg="#887788", font=("", 11, "bold"), anchor="w").pack(anchor="w")
+                tk.Label(
+                    txt,
+                    text=f"Secret · theme: {hint} · {self._secret_locked_progress_hint(kind, counts, secs)}",
+                    bg="#2a1f35",
+                    fg="#665566",
+                    font=("", 9),
+                    anchor="w",
+                    wraplength=620,
+                    justify="left",
+                ).pack(anchor="w")
+                tk.Label(row, text=f"Locked · {gp} G", bg="#2a1f35", fg="#554455", font=("", 9)).pack(side="right", padx=(8, 0))
 
     @staticmethod
     def _steam_cache_incomplete(loaded):
@@ -499,6 +1147,7 @@ class Launcher:
             "last_search_text": "",
             "auto_refresh": True,
             "show_toast": True,
+            "notify_achievements": True,
             "enable_logging": False,
             "recently_played_format": "date_time",
             "last_steamid64": "",
@@ -523,6 +1172,8 @@ class Launcher:
 
         self.auto_refresh = settings.get("auto_refresh", True)
         self.show_toast = settings.get("show_toast", True)
+        self.notify_achievements_var = tk.BooleanVar(value=settings.get("notify_achievements", True))
+        self.notify_achievements = self.notify_achievements_var.get()
         self.enable_logging = settings.get("enable_logging", False)
         self.recent_format = settings.get("recently_played_format", "date_time")
         self.last_steamid64 = settings.get("last_steamid64", "")
@@ -592,6 +1243,14 @@ class Launcher:
 
         profile_bar = tk.Frame(btn_frame, bg="#1e1e1e")
         profile_bar.pack(side="right", padx=(12, 0))
+        self.gamerscore_var = tk.StringVar(value="0 G")
+        tk.Label(
+            profile_bar,
+            textvariable=self.gamerscore_var,
+            bg="#1e1e1e",
+            fg="#7ec97e",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left", padx=(0, 14))
         tk.Label(profile_bar, text="Profile:", bg="#1e1e1e", fg="#aaaaaa", font=("", 10)).pack(side="left", padx=(0, 6))
         self.profile_switch_var = tk.StringVar(value=self.current)
         self.profile_combo = ttk.Combobox(
@@ -821,6 +1480,8 @@ class Launcher:
         self.root.after(100, self.process_queue)
         self.root.after(250, self._apply_info_panel_layout)
         threading.Thread(target=self.global_playtime_tracker, daemon=True).start()
+        self.root.after(500, self._check_achievements_unlock)
+        self.update_gamerscore_label()
 
     def center_window(self):
         self.root.update_idletasks()
@@ -987,6 +1648,10 @@ class Launcher:
                     pass
             settings["last_sort_mode"] = self.sort_var.get()
             settings["last_search_text"] = self.search_var.get()
+            if hasattr(self, "notify_achievements_var"):
+                settings["notify_achievements"] = self.notify_achievements_var.get()
+            else:
+                settings["notify_achievements"] = getattr(self, "notify_achievements", True)
             self.save(settings_path, settings)
             self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
         except Exception:
@@ -1025,6 +1690,11 @@ class Launcher:
                 changed = True
             if "steam_imported_seconds" not in g:
                 g["steam_imported_seconds"] = 0
+            if "launcher_playtime_seconds" not in g or not isinstance(g.get("launcher_playtime_seconds"), (int, float)):
+                pt = float(g.get("playtime") or 0)
+                imp = float(g.get("steam_imported_seconds") or 0)
+                g["launcher_playtime_seconds"] = max(0.0, pt - imp)
+                changed = True
             if "steam_appid" not in g:
                 g["steam_appid"] = None
                 changed = True
@@ -1652,6 +2322,7 @@ class Launcher:
                     if state['running']:
                         duration_sec = (datetime.now() - state['start_time']).total_seconds()
                         game['playtime'] += duration_sec
+                        game['launcher_playtime_seconds'] = float(game.get('launcher_playtime_seconds') or 0) + duration_sec
                         state['running'] = False
                         state['start_time'] = None
                         state['session_duration'] = timedelta(0)
@@ -1659,6 +2330,7 @@ class Launcher:
                         if self.show_toast and duration_sec > 0:
                             Toast(self.root, f"Playtime added for {game['name']}: +{self.format_playtime(duration_sec)}")
                         self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+                        self.update_queue.put(self._check_achievements_unlock)
 
             if updated:
                 self.update_queue.put(self.apply_filters)
@@ -1749,6 +2421,7 @@ class Launcher:
             "name": name,
             "path": file_path,
             "playtime": 0.0,
+            "launcher_playtime_seconds": 0.0,
             "last_launch": None,
             "favorite": False,
             "added_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1792,10 +2465,24 @@ class Launcher:
             self.add_from_dir(PATHS["xbox"])
         self.add_var.set("Add Game")
 
+    def _sync_notify_achievements(self):
+        self.notify_achievements = self.notify_achievements_var.get()
+
     def menu(self):
         menubar = tk.Menu(self.root, bg="#333", fg="#fff")
         settings_menu = tk.Menu(menubar, tearoff=0, bg="#333", fg="#fff")
         menubar.add_cascade(label="Settings", menu=settings_menu)
+
+        settings_menu.add_checkbutton(
+            label="Achievement notifications",
+            variable=self.notify_achievements_var,
+            command=self._sync_notify_achievements,
+        )
+        settings_menu.add_separator()
+
+        achievements_menu = tk.Menu(menubar, tearoff=0, bg="#333", fg="#fff")
+        achievements_menu.add_command(label="View achievements", command=self.show_achievements)
+        menubar.add_cascade(label="Achievements", menu=achievements_menu)
 
         data_menu = tk.Menu(settings_menu, tearoff=0, bg="#333", fg="#fff")
         settings_menu.add_cascade(label="Data & Sync", menu=data_menu)
@@ -1816,7 +2503,7 @@ class Launcher:
 
         tools_menu = tk.Menu(settings_menu, tearoff=0, bg="#333", fg="#fff")
         settings_menu.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Open Download Manager", command=self.open_download_manager)
+        tools_menu.add_command(label="Backup downloads…", command=self.open_download_manager)
 
         settings_menu.add_separator()
         settings_menu.add_command(label="Sign Out", command=self.sign_out)
@@ -1837,10 +2524,13 @@ class Launcher:
         if messagebox.askyesno("Reset Playtime", "Reset ALL playtime to 0 for the current profile?\nThis cannot be undone."):
             for game in self.games:
                 game["playtime"] = 0.0
+                game["launcher_playtime_seconds"] = 0.0
                 game["steam_imported_seconds"] = 0
             self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+            self._save_achievements_unlocked(set())
             self.apply_filters()
             self.update_status_bar()
+            self.update_gamerscore_label()
             Toast(self.root, "Playtime reset to 0 for all games in this profile", 4000)
 
     def clear_steam_import_watermark(self):
@@ -2280,7 +2970,7 @@ class Launcher:
         if name and name in self.profiles and name != self.current:
             if messagebox.askyesno("Confirm", f"Delete profile '{name}' and its data?"):
                 self.profiles.remove(name)
-                for file_suffix in ["_games.json", "_settings.json"]:
+                for file_suffix in ["_games.json", "_settings.json", "_achievements.json"]:
                     path = os.path.join(DIR, f"{name}{file_suffix}")
                     if os.path.exists(path):
                         os.remove(path)
@@ -2292,8 +2982,10 @@ class Launcher:
             self.games = []
             self.states = {}
             self.save(os.path.join(DIR, f"{self.current}_games.json"), self.games)
+            self._save_achievements_unlocked(set())
             self.apply_filters()
             self.update_status_bar()
+            self.update_gamerscore_label()
             self.show_no_games_placeholder()
             Toast(self.root, "All games cleared from this profile", 3500)
 
